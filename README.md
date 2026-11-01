@@ -1,95 +1,98 @@
 # veildb
 
-Manifest-first application-layer encryption for PostgreSQL, integrated with
-SQLAlchemy and optional SQLModel. Declare protected fields, attach Cryptalis,
-and use ordinary ORM operations within the [admitted compatibility matrix](docs/compatibility.md#full-capability-matrix).
+Field-level encryption for Python applications using PostgreSQL.
 
-**Research prototype; not production-security-qualified.** The
-[product requirements](docs/requirements.md) and all 34 objectives remain required.
-[Current status](docs/status.md) identifies the
-verified revision and limits; the [objective ledger](docs/BUILD_CHECKLIST.md)
-records unfinished work. Safe refusal does not make an unsupported feature complete.
+veildb explores a simple idea: a database can store sensitive information without
+being trusted to read it. Protection happens inside the application, before
+selected values reach PostgreSQL. A manifest describes the fields to protect,
+and the ORM integration connects that policy to application queries and writes.
 
-## Start here
+**Stage:** experimental research preview. Production security qualification is
+still outstanding.
 
-- [Install the preview](docs/installation.md): normal wheel installation, integration and removal.
-- [Changelog](CHANGELOG.md): unreleased candidate version and limits.
-- [Documentation map](docs/README.md): routes and one owner for each topic.
-- [Architecture](docs/architecture/README.md): components and data flow.
-- [Local development](docs/local-development.md): install, test and reproduce CI.
-- [Manifest reference](docs/manifest.md): declaration and compiler contract.
-- [Application attachment](docs/walkthrough-sqlalchemy.md): sync/async SQLAlchemy and SQLModel.
-- [Operator walkthrough](docs/walkthrough-migration.md): protect, diagnose, rotate, recover and remove.
-- [OpenBao](docs/openbao.md): optional external key custody and real local qualification.
+## Where it fits
 
-## Quick start
+An application may need a customer's email to send a message, while its database
+only needs to store that email and find matching records. veildb separates those
+responsibilities: the application handles plaintext and keys; PostgreSQL stores
+encrypted values and explicitly enabled search terms.
 
-You supply a manifest, a key provider and a private state directory:
-
-```python
-from cryptalis import Project
-
-project = Project("cryptalis.json", Base.registry,
-                  provider=my_key_provider, state_dir="/etc/myapp/cryptalis")
-
-project.doctor(owner_engine)                    # Read-only compatibility check.
-project.protect(owner_engine, runtime_role="app",
-                writers_stopped="Deploy job stopped the API and workers.",
-                search_reviewed="Emails are not enumerable.")
-
-SessionLocal = project.attach(engine)           # Replaces your sessionmaker.
-with SessionLocal(tenant_id=tenant) as session:
-    session.get(Customer, customer_id).email = "new@example.com"
-    session.commit()
+```text
+Application + key provider
+          |
+          | protect selected fields
+          v
+SQLAlchemy integration
+          |
+          | encrypted values + declared search terms
+          v
+      PostgreSQL
 ```
 
-Applications with no tenant-column tables call `SessionLocal()`. Models and queries stay
-as they are, within the
-[admitted operations](docs/compatibility.md#full-capability-matrix). Rotation and recovery
-are one call each; removal is `decrypt` then `remove`. See
-[`Project`](docs/application.md#project-the-small-api). Repeat a failed lifecycle call to
-resume it after a crash.
+SQLAlchemy is the main integration point, with an optional SQLModel adapter.
+Query support is bounded by the declared policy and the adapter's admission
+checks. The host application remains responsible for authenticating users and
+the tenant scope passed into a session.
 
-Security decisions stay visible. Statements such as `writers_stopped` are required
-and recorded in the plan. You still authenticate the tenant you pass to the session.
-Cryptalis never infers authorization or lets a restored PostgreSQL database authorize
-its own deployment. Hosts needing their own publication system can use
-[`ApplicationConfig`](docs/application.md#configure-once) and
-[explicit host contexts](docs/host-contexts.md).
+## Inside the design
 
-## Core behavior
+| Piece | Purpose |
+| --- | --- |
+| Protection manifest | Names protected models and fields, stable identifiers, tenant scope, and requested query capabilities. |
+| Value encryption | CF1 uses AES-256-GCM-SIV, fresh random nonces, and HKDF-derived keys, with authenticated tenant, field, and record context. |
+| Exact search | Separate HMAC-SHA-256 terms support declared equality queries. |
+| Key providers | Separate key custody from database storage; adapters include AWS KMS, Google Cloud KMS, and OpenBao. |
+| Lifecycle tooling | Code for planning protection, changing policies, rotating keys, and reversing protection of current data. |
 
-Sensitive values are authenticated and encrypted before PostgreSQL receives them.
-CF1 uses AES-256-GCM-SIV, random nonces, HKDF-derived keys and authenticated tenant,
-field and record context. Independent HMAC-SHA-256 terms implement declared exact
-search. PostgreSQL never receives plaintext key material.
+Search carries tradeoffs. Equality terms reveal matching values; opting into
+order queries reveals ordering. These choices need explicit review rather than
+being enabled as invisible defaults. Unsupported operations must fail explicitly,
+without plaintext fallback.
 
-The implementation includes bounded sync/async storage and query support,
-resumable protection, three distinct key-rotation workflows, current-data
-plaintext reversal/removal, fresh-cluster adoption and scoped Doctor checks.
-Integer and date fields can opt in to [range and sorting](docs/compatibility.md#order-search),
-which reveals their order in a database dump. The [compatibility matrix](docs/compatibility.md)
-is the authoritative support list. Native JSONB has a bounded storage contract;
-JSON search, prefix/fuzzy and other unadmitted operations fail
-explicitly.
+## Work on the project
 
-Provider custody is abstracted through `KeyProvider`. Development custody is
-for synthetic local data. Optional AWS, Google Cloud KMS and OpenBao adapters have
-different verification boundaries; [status](docs/status.md) records them. Passing local
-service checks does not qualify production identity, backup custody or destruction.
+The selected development stack is Python **3.12 or 3.13**, **uv**, PostgreSQL
+**16**, SQLAlchemy, and psycopg. Dependency versions are recorded in
+[pyproject.toml](pyproject.toml) and [uv.lock](uv.lock).
 
-## Develop from this checkout
+From the repository root, install the locked dependencies and optional adapters:
 
-Use Python 3.12 or 3.13 and uv. From the repository root:
-
-```console
+```sh
 uv sync --frozen --all-extras
 ```
 
-Follow [local development](docs/local-development.md) for an authorized disposable
-PostgreSQL 16 target, mandatory role probes and reproducible source/installed
-checks. Do not run tests against production data.
+Read [AGENTS.md](AGENTS.md) and the [engineering playbook](ENGINEERING_PLAYBOOK.md)
+before changing code. PostgreSQL checks must go through
+[scripts/test_postgres.py](scripts/test_postgres.py), using private role files and
+an explicitly authorized disposable database. Keep test credentials out of the
+checkout and use synthetic data for development key custody.
 
-Before implementation, read [AGENTS.md](AGENTS.md) and the
-[engineering playbook](ENGINEERING_PLAYBOOK.md). Historical evidence is routed
-through [history](docs/history/README.md); it is not current setup guidance.
+This checkout is incomplete: the referenced `docs/` and `tests/` directories,
+along with some imported runtime modules, are absent. Installing dependencies
+alone does not establish that the application or full test workflow runs.
+
+## Find your way around
+
+| Location | Contents |
+| --- | --- |
+| [src/](src/) | Encryption, manifests, ORM adapters, and lifecycle implementation. |
+| [scripts/](scripts/) | PostgreSQL verification, qualification, and release helpers. |
+| [qualification/](qualification/) | Dependency inputs for isolated qualification workflows. |
+| [spikes/](spikes/) | Research experiments, separate from the package's supported behavior. |
+| [tools/](tools/) | Research and scanning utilities. |
+| [CHANGELOG.md](CHANGELOG.md) | Preview version notes and scope. |
+
+## Boundaries
+
+The code is a prototype, not evidence of a completed security review. Provider
+adapters have their own verification limits, and local checks do not qualify
+production identity, backup custody, or key destruction. Broad SQL compatibility,
+production readiness, and performance advantages are not claimed here.
+
+Decrypting current data does not erase historical backups or previously disclosed
+information. Recovery, retention, and removal need their own operational review.
+
+## License
+
+Distributed under the [MIT License](LICENSE). See that file for the copyright
+notice and license terms.
