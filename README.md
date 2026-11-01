@@ -1,4 +1,4 @@
-# Cryptalis
+# veildb
 
 Manifest-first application-layer encryption for PostgreSQL, integrated with
 SQLAlchemy and optional SQLModel. Declare protected fields, attach Cryptalis,
