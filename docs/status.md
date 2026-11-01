@@ -1,8 +1,33 @@
 # Current implementation status
 
-Cryptalis implements a bounded research prototype. **No production release or compatibility cell is qualified.**
+veildb uses a bounded research prototype. **No production release or compatibility cell is qualified.**
 This page owns current verification and release gates; the [34-objective ledger](BUILD_CHECKLIST.md) owns remaining work.
 Use the [documentation map](README.md) to find contracts and procedures.
+
+## veildb checkout restoration — 2026-11-01
+
+The incomplete upload has been repaired by restoring 1,849 omitted files from
+the exact upstream revision matching its existing implementation and lockfile.
+Current maintainer metadata and repository links identify `arpitkjaiswal`.
+Runtime imports and serialized identifiers retain their existing namespace;
+copyright notices and historical evidence are preserved.
+
+The complete local default suite passes 3,953 test calls and 18 subtests, with
+25 call, 41 setup, and nine collection skips and no failures. A clean wheel
+installation passes 111 public-API/CF1 tests; separate installed DATE export and
+fresh-cluster recovery checks pass. Repeat-built wheel/sdist inspection,
+installed-file identity, the six-test startup check, and three optional
+research-helper tests also pass. These are current-instance development checks,
+not production qualification.
+
+The dependency vulnerability audit remains unavailable: the running environment
+denies proxy access to `api.osv.dev`. Installation/startup instructions and the
+specific network requirement were saved in the environment draft; applying and
+publishing that configuration and validation in a new task remain outstanding.
+[Repair scope, exact receipts, commands and limits](history/veildb-checkout-repair-2026-11-01.md).
+
+The upstream verification below retains its original revision and environment
+scope. It is not a new execution of those profiles in this repository.
 
 ## Post-preview OpenBao qualification TLS
 

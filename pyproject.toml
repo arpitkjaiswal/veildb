@@ -2,6 +2,7 @@
 name = "cryptalis"
 version = "0.1.0a1"
 description = "Manifest-first searchable encryption for PostgreSQL applications"
+maintainers = [{ name = "arpitkjaiswal" }]
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -23,10 +24,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Debrato2005/cryptalis"
-Documentation = "https://github.com/Debrato2005/cryptalis/blob/main/docs/README.md"
-Repository = "https://github.com/Debrato2005/cryptalis"
-Issues = "https://github.com/Debrato2005/cryptalis/issues"
+Homepage = "https://github.com/arpitkjaiswal/veildb"
+Documentation = "https://github.com/arpitkjaiswal/veildb/blob/main/docs/README.md"
+Repository = "https://github.com/arpitkjaiswal/veildb"
+Issues = "https://github.com/arpitkjaiswal/veildb/issues"
 
 [project.scripts]
 cryptalis = "cryptalis.cli:main"

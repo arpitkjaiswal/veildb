@@ -1,0 +1,6 @@
+{
+  "package": "/workspace/.venvs/veildb-installed/lib/python3.12/site-packages/cryptalis/__init__.py",
+  "verified_files": 50,
+  "cli": "passed",
+  "wheel_sha256": "9ea17f073b649aae1b3b7f29bd0bded2f3c2e6e14dee2e7c21e16ef93df74d82"
+}

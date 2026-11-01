@@ -67,15 +67,18 @@ before changing code. PostgreSQL checks must go through
 an explicitly authorized disposable database. Keep test credentials out of the
 checkout and use synthetic data for development key custody.
 
-This checkout is incomplete: the referenced `docs/` and `tests/` directories,
-along with some imported runtime modules, are absent. Installing dependencies
-alone does not establish that the application or full test workflow runs.
+Follow the [local development guide](docs/local-development.md) to provision an
+isolated PostgreSQL 16 cluster and run the suite. The [application guide](docs/application.md)
+covers configuration and usage; the [compatibility matrix](docs/compatibility.md)
+defines the admitted operations and their limits.
 
 ## Find your way around
 
 | Location | Contents |
 | --- | --- |
 | [src/](src/) | Encryption, manifests, ORM adapters, and lifecycle implementation. |
+| [tests/](tests/) | Database integration, cryptography, and lifecycle checks. |
+| [docs/](docs/README.md) | Usage, design contracts, development instructions, and recorded evidence. |
 | [scripts/](scripts/) | PostgreSQL verification, qualification, and release helpers. |
 | [qualification/](qualification/) | Dependency inputs for isolated qualification workflows. |
 | [spikes/](spikes/) | Research experiments, separate from the package's supported behavior. |
@@ -93,6 +96,8 @@ Decrypting current data does not erase historical backups or previously disclose
 information. Recovery, retention, and removal need their own operational review.
 
 ## License
+
+Maintained by [arpitkjaiswal](https://github.com/arpitkjaiswal).
 
 Distributed under the [MIT License](LICENSE). See that file for the copyright
 notice and license terms.
