@@ -1,0 +1,72 @@
+{
+  "status": "PASS_DOCUMENT_CHECKS",
+  "errors": [],
+  "local_file_anchor_links": 898,
+  "external_links_not_network_checked": 205,
+  "trace_source_sections_checked": 323,
+  "trace_properties": 130,
+  "decisions": {
+    "total": 42,
+    "decided": 9,
+    "blocked": 33
+  },
+  "production_source_files_unchanged": 16,
+  "starting_non_markdown_files_unchanged": 44,
+  "unrelated_starting_user_files_unchanged": 3,
+  "starting_user_deletions_preserved": 14,
+  "expert_packet_source_hashes_checked": 4,
+  "second_council_evidence_hashes_checked": 9,
+  "canonical_metrics": {
+    "README.md": {
+      "lines": 104,
+      "words": 705
+    },
+    "AGENTS.md": {
+      "lines": 61,
+      "words": 466
+    },
+    "ENGINEERING_PLAYBOOK.md": {
+      "lines": 146,
+      "words": 1300
+    },
+    "docs/architecture/README.md": {
+      "lines": 344,
+      "words": 3655
+    },
+    "docs/security.md": {
+      "lines": 508,
+      "words": 6750
+    },
+    "docs/lifecycle.md": {
+      "lines": 382,
+      "words": 5027
+    },
+    "docs/compatibility.md": {
+      "lines": 240,
+      "words": 3391
+    },
+    "docs/build-guide.md": {
+      "lines": 147,
+      "words": 3082
+    },
+    "docs/status.md": {
+      "lines": 129,
+      "words": 1422
+    },
+    "docs/decisions.md": {
+      "lines": 102,
+      "words": 2354
+    },
+    "docs/prior-art.md": {
+      "lines": 89,
+      "words": 1282
+    }
+  },
+  "canonical_total_lines": 2252,
+  "canonical_total_words": 29434,
+  "limits": [
+    "machine checks cannot establish normative semantic completeness",
+    "historical review text is immutable evidence",
+    "duplicate ownership requires human/council review"
+  ]
+}

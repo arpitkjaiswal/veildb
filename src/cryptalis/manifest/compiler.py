@@ -1,0 +1,1780 @@
+"""Read-only admission of protection intent against a native PostgreSQL schema.
+
+This compiler proposes protection. It does not attach, encrypt, or migrate.
+Writer and value-domain evidence comes from the trusted host, not the database.
+"""
+
+import hashlib
+import json
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from uuid import UUID, uuid4
+
+from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, Integer, Numeric, SmallInteger, String, Table, Text, UUID as SQLUUID, Uuid
+from sqlalchemy import UniqueConstraint, text
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import registry as Registry
+
+from psycopg import Error as PsycopgError
+
+from cryptalis.manifest.declaration import parse_protection_declaration
+from cryptalis.manifest.parser import MAX_DOCUMENT_BYTES, ManifestInvalid, decode_manifest_json
+from cryptalis._sqlmodel_types import autostring_impl
+from cryptalis._numeric import numeric_parameters, numeric_typmod, numeric_value
+from cryptalis._timestamp import aware_default, read_aware_default
+from cryptalis._search_layout import search_index_statements
+from cryptalis.crypto.keys import InvalidValue
+
+
+_PUBLIC_SLOTS_LAYOUT = "preserve-public-slots/v1"
+_LOCK_SCHEMAS = tuple(f'cryptalis.lock/v{version}' for version in range(1, 16))
+_INTEGER_TYPES = {'int2': (SmallInteger, postgresql.SMALLINT),
+                  'int4': (Integer, postgresql.INTEGER), 'int8': (BigInteger, postgresql.BIGINT)}
+_JSONB_CODEC = 'pg-jsonb-text/v1'
+_JSONB_NULL_POLICIES = {False: 'jsonb-none-as-json-null/v1', True: 'jsonb-none-as-sql-null/v1'}
+
+
+@dataclass(frozen=True)
+class Writer:
+    table_id: UUID
+    name: str
+    route: str
+    excluded: bool = False
+    evidence: str = ""
+
+
+@dataclass(frozen=True)
+class WriterInventory:
+    complete: bool
+    writers: tuple[Writer, ...]
+
+
+@dataclass(frozen=True)
+class SearchReview:
+    field_id: UUID
+    small_domain: bool
+    evidence: str
+
+
+@dataclass(frozen=True)
+class Issue:
+    code: str
+    location: str
+    remedy: str
+
+
+class PlanningRejected(ValueError):
+    """Known incompatibilities block the entire proposal."""
+
+    stage = "schema_admission"
+    effects = "NONE"
+    retry = "after_correction"
+
+    def __init__(self, issues: list[Issue]):
+        self.operation_id = str(uuid4())
+        self.issues = tuple(sorted(set(issues), key=lambda i: (i.location, i.code, i.remedy)))
+        super().__init__("Protection plan rejected: " + "; ".join(
+            f"{i.code} at {i.location}: {i.remedy}" for i in self.issues))
+
+
+class InspectionUnavailable(RuntimeError):
+    """Inspection failed. No schema admission or transition follows."""
+
+    code = "inspection_unavailable"
+    stage = "schema_inspection"
+    effects = "NONE"
+    retry = "after_inspection"
+    remedy = "Restore database access. Inspect the current schema, then compile a new plan."
+
+    def __init__(self, sqlstate: str | None):
+        self.operation_id = str(uuid4())
+        self.sqlstate = sqlstate
+        super().__init__(f"Database inspection failed. SQLSTATE: {sqlstate or 'UNKNOWN'}. {self.remedy}")
+
+
+@dataclass(frozen=True)
+class Change:
+    kind: str
+    table_id: str
+    field_id: str | None
+    explanation: str
+
+
+@dataclass(frozen=True)
+class ProtectionPlan:
+    lock_bytes: bytes
+    changes: tuple[Change, ...]
+    source_lock_digest: str | None = None
+    effects: str = "NONE"
+
+    @property
+    def lock_digest(self) -> str:
+        return hashlib.sha256(self.lock_bytes).hexdigest()
+
+
+def _canonical(document: object) -> bytes:
+    raw = json.dumps(document, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        raise ManifestInvalid("Compiler artifact exceeds 16 MiB")
+    return raw
+
+
+def _native_text_length(column):
+    """Read an admitted native text type and its character limit."""
+    if column['type_schema'] != 'pg_catalog':
+        raise ValueError
+    if column['type'] == 'text' and column['typmod'] == '-1':
+        return None
+    if column['type'] == 'varchar':
+        if column['typmod'] == '-1':
+            return None
+        typmod = column['typmod']
+        if isinstance(typmod, str) and typmod.isascii() and typmod.isdecimal():
+            length = int(typmod) - 4
+            if 1 <= length <= 10485760 and typmod == str(length + 4):
+                return length
+    raise ValueError
+
+
+def _text_mapping_matches(column, native):
+    try:
+        dtype = autostring_impl(column.type)
+        dtype = column.type if dtype is None else dtype
+        if getattr(dtype, '_variant_mapping', None):
+            return False
+        length = _native_text_length(native)
+    except (ValueError, KeyError, TypeError):
+        return False
+    if native['type'] == 'text':
+        return type(dtype) in (Text, postgresql.TEXT)
+    return (type(dtype) in (String, postgresql.VARCHAR)
+            and (dtype.length is None if length is None else
+                 type(dtype.length) is int and dtype.length == length))
+
+
+def _boolean_mapping_matches(column, native):
+    return (type(column.type) in (Boolean, postgresql.BOOLEAN)
+            and getattr(column.type.bind_processor, '__func__', None) is Boolean.bind_processor
+            and getattr(column.type._strict_as_bool, '__func__', None) is Boolean._strict_as_bool
+            and not getattr(column.type, '_variant_mapping', None)
+            and native['type_schema'] == 'pg_catalog' and native['type'] == 'bool'
+            and native['typmod'] == '-1'
+            and all(native[key] is None for key in
+                    ('collation', 'collation_name', 'collation_schema', 'deterministic', 'provider')))
+
+
+def _boolean_default(column):
+    if column.default is None:
+        return None
+    if column.default.is_scalar and type(column.default.arg) is bool:
+        return column.default.arg
+    raise ValueError
+
+
+def _value_default(column, codec):
+    if codec == 'boolean-u8/v1':
+        return _boolean_default(column)
+    if column.default is None:
+        return None
+    from sqlalchemy.sql.schema import ScalarElementColumnDefault
+    if codec == 'pg-numeric-decimal/v1' and type(column.default) is ScalarElementColumnDefault:
+        try:
+            numeric_value(column.default.arg)
+        except InvalidValue:
+            raise ValueError from None
+        return column.default.arg
+    if codec == 'pg-timestamptz-us-be/v1' and type(column.default) is ScalarElementColumnDefault:
+        try:
+            aware_default(column.default.arg)
+        except InvalidValue:
+            raise ValueError from None
+        return column.default.arg
+    if (codec == 'pg-date-days-be/v1' and type(column.default) is ScalarElementColumnDefault
+            and type(column.default.arg) is date):
+        return column.default.arg
+    if (codec == 'pg-timestamp-us-be/v1' and type(column.default) is ScalarElementColumnDefault
+            and type(column.default.arg) is datetime and column.default.arg.tzinfo is None):
+        return column.default.arg
+    widths = {'pg-int2-be/v1': 2, 'pg-int4-be/v1': 4, 'pg-int8-be/v1': 8}
+    width = widths.get(codec)
+    if width is not None and type(column.default) is ScalarElementColumnDefault:
+        value = column.default.arg
+        bound = 1 << (8 * width - 1)
+        if type(value) is int and -bound <= value < bound:
+            return value
+    raise ValueError
+
+
+def _compiled_default(field):
+    raw = field.get('application_default')
+    if field['source']['type'] == 'timestamptz' and raw is not None:
+        return read_aware_default(raw)
+    if field['source']['type'] == 'numeric' and raw is not None:
+        integer = type(raw) is dict
+        if integer:
+            if set(raw) != {'integer'}:
+                raise ValueError
+            raw = raw['integer']
+        if type(raw) is not str or not 1 <= len(raw) <= 147480:
+            raise ValueError
+        try:
+            value = Decimal(raw)
+            numeric_value(value)
+        except (InvalidValue, InvalidOperation):
+            raise ValueError from None
+        if integer:
+            if value.as_tuple().exponent != 0 or format(numeric_value(value), 'f') != raw:
+                raise ValueError
+            return int(value)
+        if format(value, 'E') != raw:
+            raise ValueError
+        return value
+    if field['source']['type'] == 'timestamp' and raw is not None:
+        if type(raw) is not str or len(raw) != 26:
+            raise ValueError
+        value = datetime.fromisoformat(raw)
+        if value.tzinfo is not None or value.isoformat(timespec='microseconds') != raw:
+            raise ValueError
+        return value
+    if field['source']['type'] == 'date' and raw is not None:
+        if type(raw) is not str or len(raw) != 10:
+            raise ValueError
+        value = date.fromisoformat(raw)
+        if value.isoformat() != raw:
+            raise ValueError
+        return value
+    if field['source']['type'] not in _INTEGER_TYPES or raw is None:
+        return raw
+    if type(raw) is not str or not 1 <= len(raw) <= 20:
+        raise ValueError
+    value = int(raw)
+    bound = 1 << (8 * int(field['source']['type'][3:]) - 1)
+    if str(value) != raw or not -bound <= value < bound:
+        raise ValueError
+    return value
+
+
+def _default_matches(actual, field):
+    expected = _compiled_default(field)
+    if type(actual) is not type(expected):
+        return False
+    if actual is not None and field['source']['type'] == 'timestamptz':
+        return aware_default(actual) == field['application_default']
+    if type(actual) is Decimal:
+        return actual.as_tuple() == expected.as_tuple()
+    return actual == expected
+
+
+def _value_mapping_matches(column, native):
+    return (_text_mapping_matches(column, native) or _boolean_mapping_matches(column, native)
+            or _integer_mapping_matches(column, native) or _date_mapping_matches(column, native)
+            or _uuid_mapping_matches(column, native) or _timestamp_mapping_matches(column, native)
+            or _numeric_mapping_matches(column, native) or _jsonb_mapping_matches(column, native))
+
+
+def _jsonb_type_matches(dtype):
+    return (type(dtype) is postgresql.JSONB and type(dtype.none_as_null) is bool
+            and dtype.hashable is False and dtype.comparator_factory is postgresql.JSONB.comparator_factory
+            and not getattr(dtype, '_variant_mapping', None)
+            and all(getattr(getattr(dtype, name), '__func__', None) is getattr(postgresql.JSONB, name)
+                    for name in ('bind_processor', 'result_processor', 'literal_processor',
+                                 'bind_expression', 'column_expression', 'dialect_impl', '_make_bind_processor',
+                                 'compare_values', 'coerce_compared_value'))
+            and type(dtype.astext_type) is Text and dtype.astext_type.length is None
+            and dtype.astext_type.collation is None
+            and getattr(dtype.astext_type, 'collation_schema', None) is None
+            and not getattr(dtype.astext_type, '_variant_mapping', None))
+
+
+def _jsonb_mapping_matches(column, native):
+    return (_jsonb_type_matches(column.type)
+            and native['type_schema'] == 'pg_catalog' and native['type'] == 'jsonb'
+            and native['typmod'] == '-1'
+            and all(native[key] is None for key in
+                    ('collation', 'collation_name', 'collation_schema', 'deterministic', 'provider')))
+
+
+def _jsonb_hooks_match(engine, connection=None):
+    try:
+        import psycopg
+        from cryptalis._jsonb import native_json_adapters
+        if engine.dialect._json_serializer is not None or engine.dialect._json_deserializer is not None:
+            return False
+        adapters = [psycopg.adapters]
+        if engine.dialect._psycopg_adapters_map is not None:
+            adapters.append(engine.dialect._psycopg_adapters_map)
+        if connection is not None:
+            driver = connection.connection.driver_connection
+            adapters.append(driver.adapters)
+            with driver.cursor() as cursor:
+                if not native_json_adapters(cursor.adapters):
+                    return False
+        return all(native_json_adapters(adapter) for adapter in adapters)
+    except Exception:
+        return False
+
+
+def _numeric_mapping_matches(column, native):
+    dtype = column.type
+    if type(dtype) not in (Numeric, postgresql.NUMERIC) or dtype.asdecimal is not True:
+        return False
+    try:
+        typmod = numeric_typmod(dtype.precision, dtype.scale)
+        numeric_parameters(native['typmod'])
+    except (ValueError, KeyError):
+        return False
+    return (not getattr(dtype, '_variant_mapping', None)
+            and all(getattr(getattr(dtype, name), '__func__', None) is getattr(Numeric, name)
+                    for name in ('bind_processor', 'result_processor', 'literal_processor',
+                                 'bind_expression', 'column_expression', 'dialect_impl'))
+            and native['type_schema'] == 'pg_catalog' and native['type'] == 'numeric'
+            and native['typmod'] == typmod
+            and all(native[key] is None for key in
+                    ('collation', 'collation_name', 'collation_schema', 'deterministic', 'provider')))
+
+
+def _uuid_mapping_matches(column, native):
+    dtype = column.type
+    return (_id_codec(column, native) == 'uuid16/v1'
+            and all(getattr(getattr(dtype, name), '__func__', None) is getattr(Uuid, name)
+                    for name in ('bind_processor', 'result_processor', 'literal_processor',
+                                 'bind_expression', 'column_expression', 'dialect_impl'))
+            and native['typmod'] == '-1'
+            and all(native[key] is None for key in
+                    ('collation', 'collation_name', 'collation_schema', 'deterministic', 'provider')))
+
+
+def _date_mapping_matches(column, native):
+    dtype = column.type
+    return (type(dtype) in (Date, postgresql.DATE)
+            and not getattr(dtype, '_variant_mapping', None)
+            and all(getattr(getattr(dtype, name), '__func__', None) is getattr(Date, name)
+                    for name in ('bind_processor', 'result_processor', 'literal_processor',
+                                 'bind_expression', 'column_expression', 'dialect_impl'))
+            and native['type_schema'] == 'pg_catalog' and native['type'] == 'date'
+            and native['typmod'] == '-1'
+            and all(native[key] is None for key in
+                    ('collation', 'collation_name', 'collation_schema', 'deterministic', 'provider')))
+
+
+def _timestamp_mapping_matches(column, native):
+    dtype = column.type
+    return (type(dtype) in (DateTime, postgresql.TIMESTAMP)
+            and type(dtype.timezone) is bool
+            and (getattr(dtype, 'precision', None) is None or
+                 type(dtype.precision) is int and dtype.precision == 6)
+            and not getattr(dtype, '_variant_mapping', None)
+            and all(getattr(getattr(dtype, name), '__func__', None) is getattr(DateTime, name)
+                    for name in ('bind_processor', 'result_processor', 'literal_processor',
+                                 'bind_expression', 'column_expression', 'dialect_impl'))
+            and native['type_schema'] == 'pg_catalog'
+            and native['type'] == ('timestamptz' if dtype.timezone else 'timestamp')
+            and native['typmod'] in ('-1', '6')
+            and all(native[key] is None for key in
+                    ('collation', 'collation_name', 'collation_schema', 'deterministic', 'provider')))
+
+
+def _orderable(source):
+    return source['type'] in _INTEGER_TYPES or source['type'] in ('date', 'timestamp', 'timestamptz')
+
+
+def _representation(queries):
+    return ('cf1-packed-prefix/v1' if 'prefix' in queries else
+            'cf1-packed-order/v1' if 'order' in queries else
+            'cf1-packed-equality/v1' if queries else 'cf1-storage/v1')
+
+
+def _index_ops(source):
+    if source['type'] == 'numeric':
+        return 'pg_catalog.numeric_ops'
+    return f"pg_catalog.{source['type']}_ops" if _orderable(source) else 'pg_catalog.text_ops'
+
+
+def _index_opclasses(source, queries, *, retained_pattern=False):
+    default = (_index_ops(source),)
+    if ('prefix' in queries or retained_pattern) and source['type'] in ('text', 'varchar'):
+        return default + (f"pg_catalog.{source['type']}_pattern_ops",)
+    return default
+
+
+def _has_pattern_indexes(models):
+    """Retained native pattern indexes on protected fields require their reader."""
+    for model in models:
+        indexes = model.get('source_schema', {}).get('indexes', ())
+        if not indexes:
+            continue
+        protected = {field['column'] for field in model['fields']}
+        for index in indexes:
+            if (protected.intersection(index['columns'] + index['dependency_columns'])
+                    and {'pg_catalog.text_pattern_ops', 'pg_catalog.varchar_pattern_ops'}.intersection(index['opclasses'])):
+                return True
+    return False
+
+
+def _fixed_value_width(source):
+    return {'bool': 1, 'int2': 2, 'int4': 4, 'int8': 8, 'date': 4, 'uuid': 16, 'timestamp': 8, 'timestamptz': 8}.get(source['type'])
+
+
+def _integer_mapping_matches(column, native):
+    dtype = column.type
+    return (type(dtype) in _INTEGER_TYPES.get(native['type'], ())
+            and not getattr(dtype, '_variant_mapping', None)
+            and all(getattr(getattr(dtype, name), '__func__', None) is getattr(Integer, name)
+                    for name in ('bind_processor', 'result_processor', 'literal_processor',
+                                 'bind_expression', 'column_expression', 'dialect_impl'))
+            and native['type_schema'] == 'pg_catalog' and native['typmod'] == '-1'
+            and all(native[key] is None for key in
+                    ('collation', 'collation_name', 'collation_schema', 'deterministic', 'provider')))
+
+
+def _value_codec(source):
+    if source['type'] == 'jsonb':
+        return _JSONB_CODEC
+    if source['type'] == 'timestamptz':
+        return 'pg-timestamptz-us-be/v1'
+    if source['type'] == 'numeric':
+        return 'pg-numeric-decimal/v1'
+    if source['type'] == 'timestamp':
+        return 'pg-timestamp-us-be/v1'
+    if source['type'] == 'uuid':
+        return 'uuid-bytes16/v1'
+    if source['type'] == 'date':
+        return 'pg-date-days-be/v1'
+    if source['type'] in _INTEGER_TYPES:
+        return 'pg-' + source['type'] + '-be/v1'
+    return 'boolean-u8/v1' if source['type'] == 'bool' else 'utf8-exact/v1'
+
+
+def _required_readers(models):
+    return sorted({'cf1/v1'} | {f['descriptor'].get('value_codec', f['descriptor'].get('text_codec')) for m in models for f in m['fields']}
+                  | {m['record']['codec'] for m in models}
+                  | {'uuid16/v1' for m in models if 'column' in m['tenancy']}
+                  | ({'cf1-order/v1'} if any('order' in f['queries'] for m in models for f in m['fields']) else set())
+                  | ({'pg-timestamp-order/v1'} if any(f['source']['type'] == 'timestamp' and
+                     'order' in f['queries'] for m in models for f in m['fields']) else set())
+                  | ({'pg-numeric-equality/v1'} if any(f['source']['type'] == 'numeric' and
+                     f['queries'] for m in models for f in m['fields']) else set())
+                  | ({'pg-text-prefix/v1'} if any('prefix' in f['queries']
+                     for m in models for f in m['fields']) else set())
+                  | ({'pg-text-pattern-index/v1'} if _has_pattern_indexes(models) else set())
+                  | ({'pg-varchar/v1'} if any(f['source']['type'] == 'varchar'
+                     for m in models for f in m['fields']) else set())
+                  | ({'pg-integer-default/v1'} if any(f['source']['type'] in _INTEGER_TYPES and
+                     'application_default' in f for m in models for f in m['fields']) else set())
+                  | ({'pg-date-default/v1'} if any(f['source']['type'] == 'date' and
+                     'application_default' in f for m in models for f in m['fields']) else set())
+                  | ({'pg-timestamp-default/v1'} if any(f['source']['type'] == 'timestamp' and
+                     'application_default' in f for m in models for f in m['fields']) else set()))
+
+
+def _lock_schema(models, layout, *, legacy=False):
+    kinds = {field['source']['type'] for model in models for field in model['fields']}
+    if 'jsonb' in kinds:
+        return 'cryptalis.lock/v15'
+    if (any('prefix' in field['queries'] for model in models for field in model['fields'])
+            or _has_pattern_indexes(models)):
+        return 'cryptalis.lock/v14'
+    if any(field['source']['type'] == 'numeric' and field['queries']
+           for model in models for field in model['fields']):
+        return 'cryptalis.lock/v13'
+    for kind, version in (('timestamptz', 12), ('numeric', 11), ('timestamp', 10),
+                          ('uuid', 9), ('date', 8)):
+        if kind in kinds:
+            return f'cryptalis.lock/v{version}'
+    if kinds & _INTEGER_TYPES.keys():
+        return 'cryptalis.lock/v7'
+    if layout is not None:
+        return 'cryptalis.lock/v6'
+    if any(model.get('source_metadata', {}).get('owned_sequences') for model in models):
+        return 'cryptalis.lock/v5'
+    if 'bool' in kinds:
+        return 'cryptalis.lock/v4'
+    if 'varchar' in kinds:
+        return 'cryptalis.lock/v3'
+    return 'cryptalis.lock/v1' if legacy else 'cryptalis.lock/v2'
+
+
+def _digest(document: object) -> str:
+    return hashlib.sha256(_canonical(document)).hexdigest()
+
+
+def _rows(connection, sql, **params):
+    return [dict(row) for row in connection.execute(text(sql), params).mappings()]
+
+
+@contextmanager
+def _catalog_path(connection):
+    # PostgreSQL deparsers qualify names through the current search path.
+    # Match the compiler's canonical view, then restore the caller's setting.
+    previous = connection.exec_driver_sql("SELECT pg_catalog.current_setting('search_path')").scalar_one()
+    if previous == "pg_catalog":
+        yield
+        return
+    connection.exec_driver_sql("SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)")
+    failed_sql = False
+    try:
+        yield
+    except (SQLAlchemyError, PsycopgError):
+        # The caller must roll back a database failure. That rollback also
+        # restores SET LOCAL; another query could mask the primary SQLSTATE.
+        failed_sql = True
+        raise
+    finally:
+        if not failed_sql:
+            connection.exec_driver_sql("SELECT pg_catalog.set_config('search_path', %s, true)", (previous,))
+
+
+def _schema_facts(connection, schema: str, table: str):
+    with _catalog_path(connection):
+        return _catalog_schema_facts(connection, schema, table)
+
+
+def _metadata_diff(original, current):
+    """Compare logical catalog facts; restored column slots may differ."""
+    differences = []
+    if original['relation'] != current['relation']:
+        differences.append('relation')
+    for kind in ('columns', 'constraints', 'indexes'):
+        expected = sorted(({k: v for k, v in item.items() if k != 'attnum'}
+                           for item in original[kind]), key=_canonical)
+        observed = sorted(({k: v for k, v in item.items() if k != 'attnum'}
+                           for item in current[kind]), key=_canonical)
+        if expected != observed:
+            differences.append(kind)
+    if original['dependencies'] != current['dependencies']:
+        differences.append('dependencies')
+    return differences
+
+
+def _catalog_schema_facts(connection, schema: str, table: str):
+    relations = _rows(connection, """
+        SELECT t.oid, t.relkind, t.relpersistence, t.relrowsecurity, t.relforcerowsecurity,
+               t.relhasrules,
+               EXISTS(SELECT 1 FROM pg_catalog.pg_inherits h
+                      WHERE h.inhrelid=t.oid OR h.inhparent=t.oid) AS inherited,
+               EXISTS(SELECT 1 FROM pg_catalog.pg_trigger g
+                      WHERE g.tgrelid=t.oid AND NOT g.tgisinternal) AS user_triggers
+        FROM pg_catalog.pg_class t JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname=:schema AND t.relname=:table
+    """, schema=schema, table=table)
+    if not relations:
+        return None
+    relation = relations[0]
+    oid = relation.pop("oid")
+    columns = _rows(connection, """
+        SELECT a.attnum, a.attname AS name, ty.typname AS type, ns.nspname AS type_schema,
+               a.atttypmod AS typmod, NOT a.attnotnull AS nullable,
+               a.attidentity AS identity, a.attgenerated AS generated,
+               co.collname AS collation_name, cn.nspname AS collation_schema,
+               co.collisdeterministic AS deterministic, co.collprovider AS provider,
+               pg_catalog.pg_get_expr(ad.adbin,ad.adrelid) AS default_expression
+        FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type ty ON ty.oid=a.atttypid
+        JOIN pg_catalog.pg_namespace ns ON ns.oid=ty.typnamespace
+        LEFT JOIN pg_catalog.pg_collation co ON co.oid=a.attcollation
+        LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid=co.collnamespace
+        LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
+        WHERE a.attrelid=:oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum
+    """, oid=oid)
+    for column in columns:
+        column["typmod"] = str(column["typmod"])
+        expression = column.pop("default_expression")
+        column["default_digest"] = _digest(expression) if expression is not None else None
+        column["collation"] = (f"{column['collation_schema']}.{column['collation_name']}"
+                               if column["collation_name"] else None)
+    constraints = _rows(connection, """
+        SELECT co.conname AS name, co.contype AS kind, co.condeferrable AS deferrable,
+               co.condeferred AS deferred, co.convalidated AS validated,
+               co.conrelid=:oid AS outgoing,
+               co.confrelid=:oid AS incoming,
+               n.nspname AS schema, t.relname AS "table",
+               ARRAY(SELECT a.attname FROM unnest(co.conkey) WITH ORDINALITY k(num,pos)
+                     JOIN pg_catalog.pg_attribute a ON a.attrelid=co.conrelid AND a.attnum=k.num
+                     ORDER BY k.pos) AS columns,
+               ARRAY(SELECT a.attname FROM unnest(co.confkey) WITH ORDINALITY k(num,pos)
+                     JOIN pg_catalog.pg_attribute a ON a.attrelid=co.confrelid AND a.attnum=k.num
+                     ORDER BY k.pos) AS referenced_columns,
+               pg_catalog.pg_get_constraintdef(co.oid) AS definition
+        FROM pg_catalog.pg_constraint co
+        JOIN pg_catalog.pg_class t ON t.oid=co.conrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        WHERE co.conrelid=:oid OR co.confrelid=:oid ORDER BY n.nspname,t.relname,co.conname
+    """, oid=oid)
+    indexes = _rows(connection, """
+        SELECT t.relname AS name, i.indisprimary AS "primary", i.indisunique AS "unique",
+               i.indisexclusion AS exclusion, i.indnullsnotdistinct AS nulls_not_distinct,
+               i.indimmediate AS immediate, i.indisvalid AS valid, i.indisready AS ready,
+               i.indislive AS live, i.indisreplident AS replica_identity,
+               i.indnatts AS total_columns, i.indnkeyatts AS key_columns, am.amname AS method,
+               i.indpred IS NOT NULL AS partial, i.indexprs IS NOT NULL AS expression,
+               ARRAY(SELECT a.attname FROM unnest(i.indkey) WITH ORDINALITY k(num,pos)
+                     LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.num
+                     ORDER BY k.pos) AS columns,
+               ARRAY(SELECT DISTINCT a.attname FROM pg_catalog.pg_depend d
+                     JOIN pg_catalog.pg_attribute a ON a.attrelid=d.refobjid AND a.attnum=d.refobjsubid
+                     WHERE d.classid='pg_catalog.pg_class'::regclass AND d.objid=i.indexrelid
+                     AND d.refobjid=i.indrelid ORDER BY a.attname) AS dependency_columns,
+               ARRAY(SELECT ns.nspname || '.' || op.opcname FROM unnest(i.indclass)
+                     WITH ORDINALITY k(num,pos) JOIN pg_catalog.pg_opclass op ON op.oid=k.num
+                     JOIN pg_catalog.pg_namespace ns ON ns.oid=op.opcnamespace ORDER BY k.pos) AS opclasses,
+               ARRAY(SELECT ns.nspname || '.' || co.collname FROM unnest(i.indcollation)
+                     WITH ORDINALITY k(num,pos) LEFT JOIN pg_catalog.pg_collation co ON co.oid=k.num
+                     LEFT JOIN pg_catalog.pg_namespace ns ON ns.oid=co.collnamespace ORDER BY k.pos) AS collations,
+               co.conname AS constraint_name,
+               pg_catalog.pg_get_indexdef(i.indexrelid) AS definition
+        FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class t ON t.oid=i.indexrelid
+        JOIN pg_catalog.pg_am am ON am.oid=t.relam
+        LEFT JOIN pg_catalog.pg_constraint co ON co.conindid=i.indexrelid AND co.contype IN ('p','u','x')
+        WHERE i.indrelid=:oid ORDER BY t.relname
+    """, oid=oid)
+    dependencies = _rows(connection, """
+        SELECT DISTINCT a.attname AS "column", d.classid::regclass::text AS kind
+        FROM pg_catalog.pg_depend d
+        LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=d.refobjid AND a.attnum=d.refobjsubid
+        WHERE d.refclassid='pg_catalog.pg_class'::regclass AND d.refobjid=:oid
+          AND d.classid IN ('pg_catalog.pg_rewrite'::regclass, 'pg_catalog.pg_attrdef'::regclass,
+                            'pg_catalog.pg_proc'::regclass)
+        ORDER BY kind,"column"
+    """, oid=oid)
+    for item in constraints + indexes:
+        item["definition_digest"] = _digest(item["definition"])
+    relation_names = _rows(connection, """
+        SELECT t.relname AS name FROM pg_catalog.pg_class t
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=:schema
+    """, schema=schema)
+    return {"relation": relation, "columns": columns, "constraints": constraints,
+            "indexes": indexes, "dependencies": dependencies,
+            "_relation_names": {r["name"] for r in relation_names}}
+
+
+def unrecorded_column_metadata(connection, schema, table, names):
+    """Return (column, kinds) for attribute metadata the lock does not record."""
+    wanted = set(names)
+    observed = []
+    for column in _rows(connection, """
+        SELECT a.attname AS name, a.attstattarget AS statistics, a.attstorage AS storage,
+               a.attcompression AS compression, a.attacl IS NOT NULL AS has_acl,
+               a.attoptions IS NOT NULL AS has_options,
+               pg_catalog.col_description(a.attrelid, a.attnum) AS comment
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class t ON t.oid=a.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname=:schema AND t.relname=:table AND a.attnum>0 AND NOT a.attisdropped
+    """, schema=schema, table=table):
+        if column["name"] not in wanted:
+            continue
+        kinds = [kind for kind, present in (
+            ("comment", column["comment"] is not None),
+            ("statistics target", column["statistics"] != -1),
+            ("storage setting", column["storage"] != "x"),
+            ("compression setting", column["compression"] != ""),
+            ("column grant", column["has_acl"]),
+            ("column option", column["has_options"])) if present]
+        if kinds:
+            observed.append((column["name"], kinds))
+    return observed
+
+
+def protected_extended_statistics(connection, schema, table, names):
+    """Return extended-statistics names that reference a protected column."""
+    wanted = set(names)
+    return sorted({row["name"] for row in _rows(connection, """
+        SELECT DISTINCT s.stxname AS name, a.attname AS column
+        FROM pg_catalog.pg_statistic_ext s
+        JOIN pg_catalog.pg_class t ON t.oid=s.stxrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid
+             AND a.attnum = ANY (s.stxkeys::int2[])
+        WHERE n.nspname=:schema AND t.relname=:table
+    """, schema=schema, table=table) if row["column"] in wanted})
+
+
+def sequence_metadata(connection, schema, table, names, *, expected=()):
+    """Read stable sequence facts, including expected objects while detached."""
+    wanted = set(names)
+    expected_names = {(entry['schema'], entry['name']) for entry in expected}
+    expected_oids = {entry['oid'] for entry in expected}
+    entries = []
+    for row in _rows(connection, """
+        SELECT sn.nspname AS schema, s.relname AS name, a.attname AS column,
+               s.oid::text AS oid, r.rolname AS owner,
+               tn.nspname || '.' || ty.typname AS type,
+               q.seqstart::text AS start, q.seqincrement::text AS increment,
+               q.seqmin::text AS min, q.seqmax::text AS max,
+               q.seqcache::text AS cache, q.seqcycle AS cycle,
+               s.relpersistence AS persistence,
+               pg_catalog.obj_description(s.oid, 'pg_class') AS comment,
+               own.deptype AS dependency_kind,
+               EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                       WHERE d.classid='pg_catalog.pg_class'::regclass
+                         AND d.objid=s.oid AND d.deptype='e') AS extension,
+               EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                       WHERE d.refclassid='pg_catalog.pg_class'::regclass
+                         AND d.refobjid=s.oid) AS incoming,
+               (s.relowner<>target.relowner OR s.relnamespace<>target.relnamespace
+                OR own.refobjid IS NOT NULL AND
+                   (own.refobjid<>target.oid OR a.attname IS NULL OR
+                    NOT a.attname=ANY(CAST(:columns AS pg_catalog.text[])))
+                OR EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_depend d
+                    WHERE d.classid='pg_catalog.pg_class'::regclass AND d.objid=s.oid
+                      AND NOT (
+                        d.objsubid=0 AND d.refobjsubid=0 AND d.deptype='n'
+                        AND d.refclassid='pg_catalog.pg_namespace'::regclass
+                        AND d.refobjid=s.relnamespace
+                        OR d.objsubid=0 AND own.refobjid IS NOT NULL
+                        AND d.refclassid='pg_catalog.pg_class'::regclass
+                        AND d.refobjid=own.refobjid AND d.refobjsubid=own.refobjsubid
+                        AND d.deptype=own.deptype
+                      )
+                )) AS other
+        FROM pg_catalog.pg_class s
+        JOIN pg_catalog.pg_namespace sn ON sn.oid=s.relnamespace
+        JOIN pg_catalog.pg_sequence q ON q.seqrelid=s.oid
+        JOIN pg_catalog.pg_type ty ON ty.oid=q.seqtypid
+        JOIN pg_catalog.pg_namespace tn ON tn.oid=ty.typnamespace
+        JOIN pg_catalog.pg_roles r ON r.oid=s.relowner
+        CROSS JOIN (
+            SELECT t.oid, t.relowner, t.relnamespace
+            FROM pg_catalog.pg_class t
+            JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+            WHERE n.nspname=:schema AND t.relname=:table
+        ) AS target
+        LEFT JOIN pg_catalog.pg_depend own
+          ON own.classid='pg_catalog.pg_class'::regclass AND own.objid=s.oid
+          AND own.objsubid=0 AND own.refclassid='pg_catalog.pg_class'::regclass
+          AND own.deptype IN ('a','i')
+        LEFT JOIN pg_catalog.pg_attribute a
+          ON a.attrelid=own.refobjid AND a.attnum=own.refobjsubid
+          AND a.attnum>0 AND NOT a.attisdropped
+        WHERE s.relkind='S' AND (
+            own.refobjid=target.oid AND a.attname=ANY(CAST(:columns AS pg_catalog.text[]))
+            OR s.oid=ANY(CAST(:expected_oids AS pg_catalog.oid[]))
+            OR sn.nspname=ANY(CAST(:expected_schemas AS pg_catalog.text[]))
+               AND s.relname=ANY(CAST(:expected_names AS pg_catalog.text[]))
+        )
+    """, schema=schema, table=table, columns=sorted(wanted),
+            expected_oids=sorted(expected_oids),
+            expected_schemas=sorted({item[0] for item in expected_names}),
+            expected_names=sorted({item[1] for item in expected_names})):
+        if (row['oid'] not in expected_oids
+                and (row['schema'], row['name']) not in expected_names
+                and row['column'] not in wanted):
+            continue
+        row['dependencies'] = {key: row.pop(key) for key in ('extension', 'incoming', 'other')}
+        row['acl'] = []
+        entries.append(row)
+    by_oid = {}
+    for entry in entries:
+        by_oid.setdefault(entry['oid'], []).append(entry)
+    if not entries:
+        return []
+    for row in _rows(connection, """
+        SELECT s.oid::text AS oid, grantor.rolname AS grantor,
+               CASE WHEN x.grantee=0 THEN NULL ELSE grantee.rolname END AS grantee,
+               x.privilege_type AS privilege, x.is_grantable AS grantable
+        FROM pg_catalog.pg_class s
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(s.relacl, pg_catalog.acldefault('S', s.relowner))) AS x
+        LEFT JOIN pg_catalog.pg_roles grantor ON grantor.oid=x.grantor
+        LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid=x.grantee
+        WHERE s.oid=ANY(CAST(:oids AS pg_catalog.oid[]))
+    """, oids=sorted(by_oid)):
+        oid = row.pop('oid')
+        for entry in by_oid[oid]:
+            entry['acl'].append(dict(row))
+    for entry in entries:
+        entry['acl'].sort(key=_canonical)
+    return sorted(entries, key=lambda item: (item['column'] or '', item['schema'], item['name'], item['oid']))
+
+
+def _validate_sequences(entries, model):
+    """Admit only canonical stable facts for ordinary automatic ownership."""
+    def require(condition):
+        if not condition:
+            raise ValueError
+
+    def integer(value, minimum, maximum):
+        require(type(value) is str and value.isascii())
+        try:
+            result = int(value)
+        except ValueError:
+            raise ValueError from None
+        require(value == str(result) and minimum <= result <= maximum)
+        return result
+
+    require(type(entries) is list)
+    fields = {field['column'] for field in model['fields']}
+    seen_oids, seen_names = set(), set()
+    for entry in entries:
+        require(type(entry) is dict and entry.keys() == set(
+            'schema name column oid owner type start increment min max cache cycle '
+            'persistence comment acl dependency_kind dependencies'.split()))
+        for key in ('schema', 'name', 'column', 'owner'):
+            require(type(entry[key]) is str and entry[key] and '\0' not in entry[key])
+        require(entry['schema'] == model['schema'] and entry['column'] in fields)
+        integer(entry['oid'], 1, 2**32 - 1)
+        require(entry['oid'] not in seen_oids and (entry['schema'], entry['name']) not in seen_names)
+        seen_oids.add(entry['oid'])
+        seen_names.add((entry['schema'], entry['name']))
+        require(entry['type'] in ('pg_catalog.int2', 'pg_catalog.int4', 'pg_catalog.int8'))
+        bits = {'pg_catalog.int2': 16, 'pg_catalog.int4': 32, 'pg_catalog.int8': 64}[entry['type']]
+        low = integer(entry['min'], -(2**(bits - 1)), 2**(bits - 1) - 1)
+        high = integer(entry['max'], -(2**(bits - 1)), 2**(bits - 1) - 1)
+        require(low < high)
+        integer(entry['start'], low, high)
+        require(integer(entry['increment'], -(2**63), 2**63 - 1) != 0)
+        integer(entry['cache'], 1, 2**63 - 1)
+        require(type(entry['cycle']) is bool and entry['persistence'] == 'p')
+        require(entry['comment'] is None or type(entry['comment']) is str)
+        require(entry['dependency_kind'] == 'a')
+        require(type(entry['dependencies']) is dict
+                and entry['dependencies'].keys() == {'extension', 'incoming', 'other'}
+                and all(value is False for value in entry['dependencies'].values()))
+        require(type(entry['acl']) is list)
+        for grant in entry['acl']:
+            require(type(grant) is dict and grant.keys() == {'grantor', 'grantee', 'privilege', 'grantable'})
+            require(type(grant['grantor']) is str and grant['grantor'] and '\0' not in grant['grantor'])
+            require(grant['grantee'] is None or
+                    type(grant['grantee']) is str and grant['grantee'] and '\0' not in grant['grantee'])
+            require(grant['privilege'] in ('SELECT', 'UPDATE', 'USAGE') and type(grant['grantable']) is bool)
+        canonical_acl = [_canonical(grant) for grant in entry['acl']]
+        require(canonical_acl == sorted(set(canonical_acl)))
+    require(entries == sorted(entries, key=lambda item: (item['column'], item['schema'], item['name'], item['oid'])))
+
+
+def _recorded_names(fields):
+    constraints = sorted({item["name"] for field in fields for item in field["original"]["constraints"]})
+    indexes = sorted({item["name"] for field in fields for item in field["original"]["indexes"]} | set(constraints))
+    return constraints, indexes
+
+
+ACL_LETTERS = {"SELECT": "r", "UPDATE": "w", "INSERT": "a", "REFERENCES": "x"}
+ACL_ORDER = "rwax"
+
+
+def _column_acl(connection, schema, table, columns):
+    grants = {}
+    for row in _rows(connection, """
+        SELECT a.attname AS name, COALESCE(g.rolname, 'PUBLIC') AS grantee,
+               x.privilege_type AS privilege, x.is_grantable AS grantable
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class t ON t.oid=a.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS x
+        LEFT JOIN pg_catalog.pg_roles g ON g.oid=x.grantee
+        WHERE n.nspname=:schema AND t.relname=:table
+          AND a.attnum>0 AND NOT a.attisdropped
+    """, schema=schema, table=table):
+        if row["name"] not in columns:
+            continue
+        key = (row["name"], row["grantee"], bool(row["grantable"]))
+        grants.setdefault(key, set()).add(ACL_LETTERS[row["privilege"]])
+    for (name, grantee, grantable), letters in grants.items():
+        ordered = "".join(sorted(letters, key=ACL_ORDER.index))
+        columns[name]["acl"].append(f"{grantee}|{ordered}|{str(grantable).lower()}")
+    for facts in columns.values():
+        facts["acl"].sort()
+
+
+def source_metadata(connection, schema, table, fields, *, sequences=False):
+    """Capture protected-column facts the lock must restore after reverse."""
+    columns = {field["column"]: {"comment": None, "statistics": "-1", "storage": "x",
+                                 "compression": "", "options": [], "acl": []} for field in fields}
+    for row in _rows(connection, """
+        SELECT a.attname AS name, a.attstattarget AS statistics, a.attstorage AS storage,
+               a.attcompression AS compression, a.attoptions AS options,
+               pg_catalog.col_description(a.attrelid, a.attnum) AS comment
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class t ON t.oid=a.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname=:schema AND t.relname=:table AND a.attnum>0 AND NOT a.attisdropped
+    """, schema=schema, table=table):
+        if row["name"] not in columns:
+            continue
+        columns[row["name"]].update({
+            "comment": row["comment"], "statistics": str(row["statistics"]),
+            "storage": row["storage"], "compression": row["compression"],
+            "options": list(row["options"] or [])})
+    _column_acl(connection, schema, table, columns)
+    constraints, indexes = _recorded_names(fields)
+    comments = {}
+    comments["constraints"] = {row["name"]: row["comment"] for row in _rows(connection, """
+        SELECT co.conname AS name, pg_catalog.obj_description(co.oid, 'pg_constraint') AS comment
+        FROM pg_catalog.pg_constraint co
+        JOIN pg_catalog.pg_class t ON t.oid=co.conrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname=:schema AND t.relname=:table
+          AND pg_catalog.obj_description(co.oid, 'pg_constraint') IS NOT NULL
+    """, schema=schema, table=table) if row["name"] in constraints}
+    comments["indexes"] = {row["name"]: row["comment"] for row in _rows(connection, """
+        SELECT i.relname AS name, pg_catalog.obj_description(i.oid, 'pg_class') AS comment
+        FROM pg_catalog.pg_class i
+        JOIN pg_catalog.pg_namespace n ON n.oid=i.relnamespace
+        WHERE n.nspname=:schema AND pg_catalog.obj_description(i.oid, 'pg_class') IS NOT NULL
+    """, schema=schema, table=table) if row["name"] in indexes}
+    entries = []
+    for row in _rows(connection, """
+        SELECT s.stxname AS name, s.stxkind::text[] AS kinds, s.stxstattarget AS target,
+               pg_catalog.obj_description(s.oid, 'pg_statistic_ext') AS comment,
+               (SELECT pg_catalog.array_agg(a.attname ORDER BY a.attnum)
+                FROM pg_catalog.unnest(s.stxkeys::int2[]) AS k(attnum)
+                JOIN pg_catalog.pg_attribute a ON a.attrelid=s.stxrelid AND a.attnum=k.attnum
+               ) AS columns
+        FROM pg_catalog.pg_statistic_ext s
+        JOIN pg_catalog.pg_class t ON t.oid=s.stxrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname=:schema AND t.relname=:table
+        ORDER BY s.stxname
+    """, schema=schema, table=table):
+        names = list(row["columns"] or [])
+        if not set(names) & set(columns):
+            continue
+        entry = {
+            "name": row["name"], "kinds": sorted(row["kinds"]), "columns": sorted(names),
+            "statistics": str(row["target"]), "comment": row["comment"]}
+        entry["definition_digest"] = _digest(entry)
+        entries.append(entry)
+    metadata = {"columns": columns, **comments, "extended_statistics": entries}
+    if sequences:
+        metadata['owned_sequences'] = sequence_metadata(connection, schema, table, columns)
+    return metadata
+
+
+def _metadata_issues(connection, schema, table, compiled, issues):
+    fields = compiled["fields"]
+    protected = {field["column"]: field for field in fields}
+    for row in _rows(connection, """
+        SELECT s.stxname AS name FROM pg_catalog.pg_statistic_ext s
+        JOIN pg_catalog.pg_class t ON t.oid=s.stxrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+        WHERE n.nspname=:schema AND t.relname=:table AND s.stxexprs IS NOT NULL
+    """, schema=schema, table=table):
+        issues.append(Issue("unsupported_dependency", f"{compiled['model']}.{row['name']}",
+                            "Drop expression extended statistics before planning; Cryptalis "
+                            "does not capture them."))
+    sequences = compiled['source_metadata']['owned_sequences']
+    try:
+        _validate_sequences(sequences, compiled)
+    except (KeyError, TypeError, ValueError):
+        location = f"{compiled['model']}.{sequences[0]['name']}" if len(sequences) == 1 else compiled['model']
+        issues.append(Issue("unsupported_dependency", location,
+                            "Use ordinary persistent sequences owned by protected columns in the "
+                            "same schema and owner, without identity, extension or other dependencies."))
+
+
+def _id_codec(column, actual):
+    if getattr(column.type, "_variant_mapping", None) or actual["type_schema"] != "pg_catalog":
+        return None
+    if type(column.type) in (Uuid, SQLUUID, postgresql.UUID) and column.type.as_uuid:
+        if getattr(column.type, "native_uuid", True) and actual["type"] == "uuid":
+            return "uuid16/v1"
+    if type(column.type) is BigInteger and actual["type"] == "int8":
+        return "int64-be/v1"
+    return None
+
+
+def _server_generation(column, actual):
+    return (actual["identity"] or actual["generated"] or actual["default_digest"]
+            or column.server_default is not None or column.server_onupdate is not None
+            or column.identity is not None or column.computed is not None
+            or (column.default is not None and not column.default.is_callable
+                and not column.default.is_scalar))
+
+
+def _host_evidence(declaration, writers, search_reviews, issues):
+    def refuse(code, location, remedy):
+        issues.append(Issue(code, location, remedy))
+    table_ids = {m.table_id for m in declaration.models}
+    field_ids = {f.field_id for m in declaration.models for f in m.fields if f.queries}
+    if (not isinstance(writers, WriterInventory) or writers.complete is not True
+            or not isinstance(writers.writers, tuple) or not isinstance(search_reviews, tuple)):
+        refuse("writer_inventory", "writers", "Supply a complete inventory for every protected table.")
+        return {}, []
+    records = []
+    names = set()
+    for writer in writers.writers:
+        if not isinstance(writer, Writer) or writer.table_id not in table_ids:
+            refuse("writer_inventory", "writers", "Use writer records for declared table IDs only.")
+            continue
+        if (not isinstance(writer.name, str) or not writer.name.strip()
+                or not isinstance(writer.evidence, str) or not writer.evidence.strip()
+                or (writer.table_id, writer.name) in names or type(writer.excluded) is not bool):
+            refuse("writer_inventory", "writers", "Give each writer a distinct name and evidence reference.")
+            continue
+        names.add((writer.table_id, writer.name))
+        if writer.route not in ("sqlalchemy", "raw_sql", "copy", "external") or (
+                writer.route != "sqlalchemy" and not writer.excluded):
+            refuse("unsupported_writer", "writers", "Exclude opaque SQL, COPY, and separate drivers. Resolve unknown routes.")
+        records.append({**asdict(writer), "table_id": str(writer.table_id)})
+    for model in declaration.models:
+        if not any(w.table_id == model.table_id for w in writers.writers if isinstance(w, Writer)):
+            refuse("writer_inventory", model.model, "Inventory the writers for this protected table.")
+    domain_records = []
+    seen = set()
+    for review in search_reviews:
+        if not isinstance(review, SearchReview) or review.field_id not in field_ids:
+            refuse("search_domain_unknown", "search_reviews", "Review declared searchable fields only.")
+            continue
+        if (review.field_id in seen or type(review.small_domain) is not bool
+                or not isinstance(review.evidence, str) or not review.evidence.strip()):
+            refuse("search_domain_unknown", "search_reviews", "Give each searchable field one domain review and evidence reference.")
+            continue
+        seen.add(review.field_id)
+        if review.small_domain:
+            refuse("small_search_domain", str(review.field_id), "Use storage-only protection for an enumerable value domain.")
+        domain_records.append({**asdict(review), "field_id": str(review.field_id), "evidence_kind": "host_assertion"})
+    for field_id in field_ids - seen:
+        refuse("search_domain_unknown", str(field_id), "Review the value domain. Missing evidence blocks search admission.")
+    return {"complete": True, "evidence_kind": "host_assertion",
+            "writers": sorted(records, key=lambda w: (w["table_id"], w["name"]))}, sorted(domain_records, key=lambda r: r["field_id"])
+
+
+
+def _exact_search_collation(source):
+    """Only qualified native C or deterministic database-default equality."""
+    return (source["deterministic"] is True and
+            (source["collation"], source["provider"]) in
+            (("pg_catalog.C", "c"), ("pg_catalog.default", "d")))
+
+def _compile_model(model, mapper, facts, issues, schema):
+    def refuse(code, location, remedy):
+        issues.append(Issue(code, f"{model.model}.{location}" if location else model.model, remedy))
+    table = mapper.local_table
+    relation_names = facts.pop("_relation_names")
+    relation = facts["relation"]
+    if (relation["relkind"] != "r" or relation["relpersistence"] != "p"
+            or any(relation[k] for k in ("relrowsecurity", "relforcerowsecurity", "relhasrules", "inherited", "user_triggers"))):
+        refuse("unsupported_table", "", "Use an ordinary table without inheritance, RLS, rules, or user triggers.")
+    columns = {c["name"]: c for c in facts["columns"]}
+    mapped = {}
+    for prop in mapper.column_attrs:
+        if len(prop.columns) == 1 and isinstance(prop.columns[0], Column) and prop.columns[0].table is table:
+            mapped[prop.key] = prop.columns[0]
+    primary = [c for c in facts["constraints"] if c["kind"] == "p" and c["outgoing"]]
+    pk = list(mapper.primary_key)
+    if (len(pk) != 1 or len(primary) != 1 or primary[0]["columns"] != [pk[0].name]
+            or list(table.primary_key.columns) != pk or pk[0].name not in columns):
+        refuse("record_identity", "", "Use one mapped, non-null primary key with an admitted context codec.")
+        return None
+    pk_column = pk[0]
+    actual_pk = columns[pk_column.name]
+    record_codec = _id_codec(pk_column, actual_pk)
+    if not record_codec or actual_pk["nullable"] or pk_column.nullable:
+        refuse("record_identity", pk_column.name, "Use a non-null native UUID or bigint application key.")
+    if _server_generation(pk_column, actual_pk) or pk_column.onupdate is not None:
+        refuse("server_generated_key", pk_column.name, "Assign keys in the application. Remove identity, serial, and database defaults.")
+    tenancy = {"single_tenant": True, "context_id": str(model.table_id)}
+    tenant_name = None
+    if model.tenant_column is not None:
+        tenant = mapped.get(model.tenant_column)
+        actual = columns.get(tenant.name) if tenant is not None else None
+        if (actual is None or _id_codec(tenant, actual) != "uuid16/v1" or actual["nullable"]
+                or tenant.nullable or _server_generation(tenant, actual)
+                or tenant.onupdate is not None):
+            refuse("tenant_context", model.tenant_column, "Use a mapped, non-null, application-assigned UUID tenant column.")
+        else:
+            tenant_name = tenant.name
+            tenancy = {"column": tenant_name, "codec": "uuid16/v1"}
+    fields = []
+    used_columns = set()
+    for field in model.fields:
+        column = mapped.get(field.name)
+        actual = columns.get(column.name) if column is not None else None
+        if actual is None:
+            refuse("mapping_mismatch", field.name, "Map the field to one existing native table column.")
+            continue
+        if column.name in used_columns:
+            refuse("ambiguous_field", field.name, "Declare each physical protected column once.")
+        used_columns.add(column.name)
+        if column is pk_column or column.name == tenant_name:
+            refuse("context_field", field.name, "Keep primary-key and tenant context columns unprotected.")
+        boolean = actual['type'] == 'bool'
+        jsonb = actual['type'] == 'jsonb'
+        if not _value_mapping_matches(column, actual):
+            refuse("unsupported_type", field.name, "Match an admitted native type with its standard mapping and the same length.")
+            if jsonb:
+                continue
+        if column.nullable != actual["nullable"]:
+            refuse("mapping_mismatch", field.name, "Match mapped and database nullability before planning.")
+        if jsonb and field.queries:
+            refuse("unsupported_query", field.name, "Use storage-only protection for native JSONB values.")
+            continue
+        application_default = None
+        try:
+            application_default = _value_default(column, _value_codec(actual))
+        except ValueError:
+            refuse("protected_default", field.name, "Use a literal native Boolean, in-range integer or date client default, or assign an admitted value.")
+        if (_server_generation(column, actual)
+                or column.onupdate is not None):
+            refuse("protected_default", field.name, "Remove protected defaults and generated values. Assign values through admitted writes.")
+        if field.queries and ('order' in field.queries) != _orderable(actual):
+            refuse("unsupported_query", field.name, "Declare order search on integer, date and timestamp fields only. "
+                   "They admit no other search; use storage-only protection otherwise.")
+        elif _fixed_value_width(actual) is not None and field.queries and not _orderable(actual):
+            refuse("unsupported_query", field.name, "Use storage-only protection for this native value domain.")
+        if 'prefix' in field.queries and actual['type'] not in ('text', 'varchar'):
+            refuse("unsupported_query", field.name, "Declare prefix search on native TEXT or VARCHAR only.")
+            continue
+        # Native deterministic default equality is byte-exact, like native C.
+        # Names outside pg_catalog do not inherit either qualified identity.
+        mapped_collation = getattr(column.type, "collation", None)
+        if field.queries and actual['type'] in ('text', 'varchar') and (not _exact_search_collation(actual) or
+                mapped_collation != ("C" if actual["collation"] == "pg_catalog.C" else None)):
+            refuse("unsupported_collation", field.name,
+                   "Match explicit native C or implicit deterministic database-default text equivalence.")
+        unique_indexes = []
+        expected_scope = [column.name] if model.tenant_column is None else [tenant_name, column.name]
+        for constraint in facts["constraints"]:
+            affected = ((constraint["outgoing"] and column.name in constraint["columns"])
+                        or (constraint["incoming"] and column.name in constraint["referenced_columns"]))
+            if affected and (jsonb or constraint["kind"] != "u"):
+                refuse("unsupported_constraint", field.name,
+                       "Exclude JSONB storage from native constraints." if jsonb else
+                       "Exclude this field from CHECK, foreign-key, and exclusion constraints.")
+        for dep in facts["dependencies"]:
+            if dep["column"] in (None, column.name):
+                refuse("unsupported_dependency", field.name, "Remove dependent views, generated columns, or stored routines before protection.")
+        for index in facts["indexes"]:
+            if column.name not in index["columns"] + index["dependency_columns"]:
+                continue
+            if jsonb:
+                refuse("unsupported_index", field.name, "Exclude storage-only JSONB from native indexes before protection.")
+                continue
+            base_ok = (index["method"] == "btree" and index["valid"] and index["ready"]
+                       and index["live"] and not index["partial"] and not index["expression"]
+                       and index["total_columns"] == index["key_columns"]
+                       and not index["exclusion"] and not index["replica_identity"])
+            scope_ops = [] if model.tenant_column is None else ["pg_catalog.uuid_ops"]
+            expected_ops = [scope_ops + [op] for op in _index_opclasses(actual, field.queries)]
+            expected_collations = [actual["collation"]] if model.tenant_column is None else [None, actual["collation"]]
+            if index["unique"]:
+                if (not base_ok or index["columns"] != expected_scope or index["nulls_not_distinct"]
+                        or not index["immediate"] or index["opclasses"] not in expected_ops
+                        or index["collations"] != expected_collations):
+                    refuse("unsupported_uniqueness", field.name, "Use immediate tenant-scoped uniqueness with default distinct-NULL behavior.")
+                else:
+                    unique_indexes.append(index["name"])
+                if "unique" not in field.queries:
+                    refuse("undeclared_uniqueness", field.name, "Declare unique and accept its leakage. Existing uniqueness cannot disappear.")
+            elif (not base_ok or index["columns"] != [column.name]
+                  or index["opclasses"] not in [[op] for op in _index_opclasses(actual, field.queries)]
+                  or index["collations"] != [actual["collation"]]
+                  or "equality" not in field.queries):
+                refuse("unsupported_index", field.name, "Use an ordinary equality index, or exclude the field from this index.")
+        for constraint in table.constraints:
+            if isinstance(constraint, UniqueConstraint) and column.name in [c.name for c in constraint.columns]:
+                names = [c.name for c in constraint.columns]
+                if not any(c["outgoing"] and c["kind"] == "u" and c["columns"] == names for c in facts["constraints"]):
+                    refuse("mapping_mismatch", field.name, "Restore the mapped unique constraint in the native schema before planning.")
+        if "unique" in field.queries and not unique_indexes:
+            refuse("missing_uniqueness", field.name, "Create and qualify the native tenant-scoped unique constraint before protection.")
+        representation = _representation(field.queries)
+        descriptor = _descriptor(None, str(model.table_id), str(field.field_id), record_codec,
+                                 "uuid16/v1" if model.tenant_column is not None else "single-tenant-uuid/v1", representation,
+                                 _value_codec(actual), field.prefix_lengths,
+                                 column.type.none_as_null if jsonb else None)
+        payload = "_cryptalis_" + field.field_id.hex
+        if payload in columns:
+            refuse("generated_name_collision", field.name, "Resolve the generated payload-column name collision before planning.")
+        if field.queries and payload + "_eq" in relation_names:
+            refuse("generated_name_collision", field.name, "Resolve the generated equality-index name collision before planning.")
+        if 'prefix' in field.queries and payload + "_prefix" in relation_names:
+            refuse("generated_name_collision", field.name, "Resolve the generated prefix-index name collision before planning.")
+        fields.append({"name": field.name, "column": column.name, "field_id": str(field.field_id),
+                       "queries": list(field.queries), "representation": representation,
+                       "payload_column": payload, "unique_indexes": unique_indexes,
+                       "original": {
+                           "constraints": [{"name": c["name"], "definition": c["definition"]}
+                                           for c in facts["constraints"] if c["outgoing"] and c["kind"] == "u"
+                                           and column.name in c["columns"]],
+                           "indexes": [{"name": i["name"], "definition": i["definition"]}
+                                       for i in facts["indexes"] if column.name in i["columns"]
+                                       and i["constraint_name"] is None and not i["partial"] and not i["expression"]],
+                       },
+                       "source": {"type": actual["type"], "nullable": actual["nullable"], "collation": actual["collation"]},
+                       "descriptor": descriptor})
+        if actual['type'] == 'numeric':
+            fields[-1]['source']['typmod'] = actual['typmod']
+        if boolean or (_fixed_value_width(actual) is not None or actual['type'] == 'numeric') and application_default is not None:
+            fields[-1]['application_default'] = (application_default if boolean else
+                aware_default(application_default) if actual['type'] == 'timestamptz' else
+                application_default.isoformat(timespec='microseconds') if actual['type'] == 'timestamp' else
+                application_default.isoformat() if actual['type'] == 'date' else
+                {'integer': format(Decimal(application_default), 'f')} if actual['type'] == 'numeric' and type(application_default) is int else
+                format(application_default, 'E') if actual['type'] == 'numeric' else
+                str(application_default))
+    for item in facts["constraints"] + facts["indexes"]:
+        del item["definition"]
+    return {"model": model.model, "table_id": str(model.table_id),
+            "schema": schema, "table": table.name,
+            "record": {"column": pk_column.name, "codec": record_codec},
+            "tenancy": tenancy, "fields": fields, "source_schema": facts}
+
+
+def _descriptor(domain_id, table_id, field_id, record_codec, tenant_codec, representation,
+                value_codec='utf8-exact/v1', prefix_lengths=None, json_none_as_null=None):
+    descriptor = {"schema": "cryptalis.context/v1", "domain_id": domain_id,
+            "table_id": table_id, "field_id": field_id, "text_codec": "utf8-exact/v1",
+            "normalizer": "identity/v1", "null_policy": "sql-null/v1",
+            "record_codec": record_codec, "tenant_codec": tenant_codec, "representation": representation}
+    if value_codec in ('boolean-u8/v1', 'pg-int2-be/v1', 'pg-int4-be/v1', 'pg-int8-be/v1', 'pg-date-days-be/v1', 'date-ordinal-u32/v1', 'uuid-bytes16/v1', 'pg-timestamp-us-be/v1', 'pg-timestamptz-us-be/v1', 'pg-numeric-decimal/v1', _JSONB_CODEC):
+        descriptor['schema'] = 'cryptalis.context/v2'
+        del descriptor['text_codec']
+        descriptor['value_codec'] = value_codec
+    elif value_codec != 'utf8-exact/v1':
+        raise ValueError
+    if value_codec == _JSONB_CODEC:
+        if type(json_none_as_null) is not bool or representation != 'cf1-storage/v1':
+            raise ValueError
+        descriptor['null_policy'] = _JSONB_NULL_POLICIES[json_none_as_null]
+    elif json_none_as_null is not None:
+        raise ValueError
+    if value_codec == 'pg-numeric-decimal/v1' and representation == 'cf1-packed-equality/v1':
+        descriptor['normalizer'] = 'pg-numeric-equality/v1'
+    if representation == 'cf1-packed-prefix/v1':
+        if (value_codec != 'utf8-exact/v1' or type(prefix_lengths) is not tuple or len(prefix_lengths) != 2
+                or any(type(bound) is not int for bound in prefix_lengths)
+                or not 1 <= prefix_lengths[0] <= prefix_lengths[1] <= 256):
+            raise ValueError
+        descriptor['schema'] = 'cryptalis.context/v3'
+        descriptor['prefix_lengths'] = dict(zip(('min', 'max'), prefix_lengths))
+    elif prefix_lengths is not None:
+        raise ValueError
+    return descriptor
+
+
+def _ddl(document, engine):
+    quote = engine.dialect.identifier_preparer.quote_identifier
+    statements = []
+    for model in document["models"]:
+        table = f'{quote(model["schema"])}.{quote(model["table"])}'
+        for field in model["fields"]:
+            payload = quote(field["payload_column"])
+            statements.append(f"ALTER TABLE {table} ADD COLUMN {payload} pg_catalog.bytea")
+            statements.extend(search_index_statements(model, field, quote, table))
+    return {"expand": statements,
+            "requires_before_switch": ["qualified_cf1_framing", "writer_exclusion", "full_value_verification", "matching_deployment_policy"]}
+
+
+def _previous_lock(raw, current, engine):
+    """Reject inconsistent compiler artifacts before computing a semantic diff."""
+    old = decode_manifest_json(raw)
+    from cryptalis._search_layout import require_prefix_qualification, requires_prefix_scope
+    if requires_prefix_scope(old):
+        require_prefix_qualification()
+    try:
+        uuid_lock = old.get('schema') in _LOCK_SCHEMAS[8:]
+        timestamp_lock = old.get('schema') in _LOCK_SCHEMAS[9:]
+        numeric_lock = old.get('schema') in _LOCK_SCHEMAS[10:]
+        timestamptz_lock = old.get('schema') in _LOCK_SCHEMAS[11:]
+        numeric_search_lock = old.get('schema') in _LOCK_SCHEMAS[12:]
+        prefix_lock = old.get('schema') in _LOCK_SCHEMAS[13:]
+        jsonb_lock = old.get('schema') in _LOCK_SCHEMAS[14:]
+        date_lock = old.get('schema') in _LOCK_SCHEMAS[7:]
+        integer_lock = old.get('schema') in _LOCK_SCHEMAS[6:]
+        public_slots = old.get('schema') == 'cryptalis.lock/v6' or integer_lock and old.get('layout') is not None
+        members = set('schema profile domain_id database declaration models writer_inventory search_reviews required_readers ddl'.split())
+        if public_slots or integer_lock:
+            members.add('layout')
+        if (old.keys() != members or old["schema"] not in _LOCK_SCHEMAS
+                or old["profile"] != "cf1" or old["domain_id"] != current["domain_id"]
+                or old["database"] != {"major": 16, "encoding": "UTF8"}):
+            raise ValueError
+        if integer_lock and old['layout'] is not None and (type(old['layout']) is not str or old['layout'] != _PUBLIC_SLOTS_LAYOUT):
+            raise ValueError
+        if public_slots and (type(old['layout']) is not str or old['layout'] != _PUBLIC_SLOTS_LAYOUT):
+            raise ValueError
+        declaration = parse_protection_declaration(_canonical(old["declaration"]))
+        if str(declaration.domain_id) != old["domain_id"] or not isinstance(old["models"], list):
+            raise ValueError
+        if len(old["models"]) != len(declaration.models):
+            raise ValueError
+        seen = set()
+        sequence_oids, sequence_names = set(), set()
+        for model, declared in zip(old["models"], declaration.models, strict=True):
+            expected = set('model table_id schema table record tenancy fields source_schema source_metadata'.split())
+            if old["schema"] == "cryptalis.lock/v1":
+                expected.discard("source_metadata")
+            if model.keys() != expected or model["table_id"] != str(declared.table_id) or model["model"] != declared.model:
+                raise ValueError
+            if model["table_id"] in seen or not isinstance(model["schema"], str) or not isinstance(model["table"], str):
+                raise ValueError
+            seen.add(model["table_id"])
+            if model["record"].keys() != {"column", "codec"} or model["record"]["codec"] not in ("uuid16/v1", "int64-be/v1"):
+                raise ValueError
+            if declared.tenant_column is None:
+                if model["tenancy"] != {"single_tenant": True, "context_id": model["table_id"]}:
+                    raise ValueError
+                tenant_codec = "single-tenant-uuid/v1"
+            else:
+                if model["tenancy"].keys() != {"column", "codec"} or model["tenancy"]["codec"] != "uuid16/v1":
+                    raise ValueError
+                tenant_codec = "uuid16/v1"
+            if model["source_schema"].keys() != {"relation", "columns", "constraints", "indexes", "dependencies"}:
+                raise ValueError
+            if old["schema"] != "cryptalis.lock/v1":
+                metadata = model["source_metadata"]
+                metadata_keys = {"columns", "constraints", "indexes", "extended_statistics"}
+                if old['schema'] in _LOCK_SCHEMAS[4:]:
+                    metadata_keys.add('owned_sequences')
+                if set(metadata) != metadata_keys:
+                    raise ValueError
+                if not all(isinstance(metadata[key], dict) for key in ("columns", "constraints", "indexes")):
+                    raise ValueError
+                if not isinstance(metadata["extended_statistics"], list):
+                    raise ValueError
+                for facts in metadata["columns"].values():
+                    if set(facts) != {"comment", "statistics", "storage", "compression", "options", "acl"}:
+                        raise ValueError
+                    if not isinstance(facts["options"], list) or not isinstance(facts["acl"], list):
+                        raise ValueError
+                if not all(isinstance(value, str) for value in (*metadata["constraints"].values(),
+                                                                *metadata["indexes"].values())):
+                    raise ValueError
+                for entry in metadata["extended_statistics"]:
+                    if set(entry) != {"name", "kinds", "columns", "statistics", "comment", "definition_digest"}:
+                        raise ValueError
+                    if not isinstance(entry["kinds"], list) or not isinstance(entry["columns"], list):
+                        raise ValueError
+                if old['schema'] in _LOCK_SCHEMAS[4:]:
+                    _validate_sequences(metadata['owned_sequences'], model)
+                    for entry in metadata['owned_sequences']:
+                        name = (entry['schema'], entry['name'])
+                        if entry['oid'] in sequence_oids or name in sequence_names:
+                            raise ValueError
+                        sequence_oids.add(entry['oid'])
+                        sequence_names.add(name)
+            if not isinstance(model["fields"], list) or len(model["fields"]) != len(declared.fields):
+                raise ValueError
+            for field, intent in zip(model["fields"], declared.fields, strict=True):
+                boolean = field['source']['type'] == 'bool'
+                if 'prefix' in intent.queries and (not prefix_lock or field['source']['type'] not in ('text', 'varchar')):
+                    raise ValueError
+                if field['source']['type'] == 'uuid' and (not uuid_lock or intent.queries):
+                    raise ValueError
+                if field['source']['type'] == 'timestamp' and (not timestamp_lock or intent.queries and 'order' not in intent.queries):
+                    raise ValueError
+                if field['source']['type'] == 'timestamptz' and (not timestamptz_lock or intent.queries and 'order' not in intent.queries):
+                    raise ValueError
+                if field['source']['type'] == 'numeric' and (not numeric_lock or
+                        intent.queries and (not numeric_search_lock or set(intent.queries) - {'equality', 'unique'})):
+                    raise ValueError
+                if field['source']['type'] == 'jsonb' and (not jsonb_lock or intent.queries):
+                    raise ValueError
+                if field['source']['type'] in _INTEGER_TYPES and (not integer_lock or intent.queries and 'order' not in intent.queries):
+                    raise ValueError
+                if field['source']['type'] == 'date' and (not date_lock or intent.queries and 'order' not in intent.queries):
+                    raise ValueError
+                members = set('name column field_id queries representation payload_column unique_indexes original source descriptor descriptor_digest'.split())
+                if boolean:
+                    members.add('application_default')
+                    if (old['schema'] not in _LOCK_SCHEMAS[3:] or intent.queries
+                            or field['application_default'] is not None and type(field['application_default']) is not bool):
+                        raise ValueError
+                if (field['source']['type'] in _INTEGER_TYPES or field['source']['type'] in ('date', 'timestamp', 'timestamptz', 'numeric')) and 'application_default' in field:
+                    if _compiled_default(field) is None:
+                        raise ValueError
+                    members.add('application_default')
+                if field.keys() != members or field["field_id"] != str(intent.field_id) or field["name"] != intent.name:
+                    raise ValueError
+                if field["queries"] != list(intent.queries) or not isinstance(field["column"], str):
+                    raise ValueError
+                representation = _representation(intent.queries)
+                codec = _value_codec(field['source'])
+                json_none_as_null = None
+                if codec == _JSONB_CODEC:
+                    null_policy = field['descriptor'].get('null_policy')
+                    if null_policy not in _JSONB_NULL_POLICIES.values():
+                        raise ValueError
+                    json_none_as_null = null_policy == _JSONB_NULL_POLICIES[True]
+                if field['source']['type'] == 'date':
+                    codec = field['descriptor'].get('value_codec')
+                    if codec not in ('pg-date-days-be/v1', 'date-ordinal-u32/v1'):
+                        raise ValueError
+                    if codec == 'date-ordinal-u32/v1' and 'application_default' in field:
+                        raise ValueError
+                expected = _descriptor(old["domain_id"], model["table_id"], field["field_id"], model["record"]["codec"], tenant_codec, representation,
+                                       codec, intent.prefix_lengths, json_none_as_null)
+                if (field["descriptor"] != expected or field["descriptor_digest"] != _digest(expected)
+                        or field["representation"] != representation
+                        or field["payload_column"] != "_cryptalis_" + intent.field_id.hex):
+                    raise ValueError
+                if field["original"].keys() != {"constraints", "indexes"}:
+                    raise ValueError
+                for originals in field["original"].values():
+                    if not isinstance(originals, list) or any(x.keys() != {"name", "definition"} or not all(isinstance(v, str) for v in x.values()) for x in originals):
+                        raise ValueError
+            if any(not isinstance(model["source_schema"][key], list) for key in ("columns", "constraints", "indexes", "dependencies")):
+                raise ValueError
+            _validate_prior_source(model, varchar=old['schema'] in _LOCK_SCHEMAS[2:],
+                                   boolean=old['schema'] in _LOCK_SCHEMAS[3:], integer=integer_lock, date_values=date_lock, uuid_values=uuid_lock, timestamp_values=timestamp_lock, numeric_values=numeric_lock, timestamptz_values=timestamptz_lock, numeric_search=numeric_search_lock, prefix_search=prefix_lock, jsonb_values=jsonb_lock)
+            if public_slots:
+                slots = [column['attnum'] for column in model['source_schema']['columns']]
+                if (any(type(slot) is not int or not 0 < slot < 32768 for slot in slots)
+                        or slots != sorted(set(slots))):
+                    raise ValueError
+        inventory = old["writer_inventory"]
+        if inventory.keys() != {"complete", "evidence_kind", "writers"} or inventory["evidence_kind"] != "host_assertion":
+            raise ValueError
+        writers = WriterInventory(inventory["complete"], tuple(Writer(UUID(w["table_id"]), w["name"], w["route"], w["excluded"], w["evidence"]) for w in inventory["writers"]))
+        reviews = tuple(SearchReview(UUID(r["field_id"]), r["small_domain"], r["evidence"]) for r in old["search_reviews"])
+        errors = []
+        host, domain_reviews = _host_evidence(declaration, writers, reviews, errors)
+        if errors or inventory != host or domain_reviews != old["search_reviews"] or old["ddl"] != _ddl(old, engine):
+            raise ValueError
+        expected_schema = _lock_schema(old['models'], old.get('layout'), legacy=old['schema'] == 'cryptalis.lock/v1')
+        if old['schema'] != expected_schema:
+            raise ValueError
+        if old["required_readers"] != _required_readers(old['models']):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise ManifestInvalid("Previous lock has an invalid compiler structure or inconsistent context") from None
+    return old
+
+
+def _validate_catalog_facts(facts):
+    """Validate recorded catalog structure, separately from field admission."""
+    def require(condition):
+        if not condition:
+            raise ValueError
+    def members(value, keys, bool_keys=(), int_keys=(), list_keys=(), optional_keys=()):
+        require(isinstance(value, dict) and value.keys() == set(keys.split()))
+        for key, item in value.items():
+            if key in optional_keys and item is None:
+                continue
+            elif key in bool_keys:
+                require(type(item) is bool)
+            elif key in int_keys:
+                require(type(item) is int and item >= 0)
+            elif key in list_keys:
+                require(isinstance(item, list) and all(isinstance(v, str) or v is None for v in item))
+            else:
+                require(isinstance(item, str))
+    require(isinstance(facts, dict) and facts.keys() == {'relation', 'columns', 'constraints', 'indexes', 'dependencies'})
+    require(all(isinstance(facts[key], list) for key in ('columns', 'constraints', 'indexes', 'dependencies')))
+    members(facts["relation"], "relkind relpersistence relrowsecurity relforcerowsecurity relhasrules inherited user_triggers",
+            bool_keys=("relrowsecurity", "relforcerowsecurity", "relhasrules", "inherited", "user_triggers"))
+    columns = {}
+    for column in facts["columns"]:
+        members(column, "attnum name type type_schema typmod nullable identity generated collation_name collation_schema deterministic provider default_digest collation",
+                bool_keys=("nullable", "deterministic"), int_keys=("attnum",),
+                optional_keys=("collation_name", "collation_schema", "provider", "default_digest", "collation", "deterministic"))
+        # Determinism is nullable for non-collatable types.
+        require(column["deterministic"] is None or type(column["deterministic"]) is bool)
+        require(column["name"] not in columns and column["attnum"] > 0)
+        require(column["collation"] == (f'{column["collation_schema"]}.{column["collation_name"]}' if column["collation_name"] else None))
+        columns[column["name"]] = column
+    for constraint in facts["constraints"]:
+        members(constraint, "name kind deferrable deferred validated outgoing incoming schema table columns referenced_columns definition_digest",
+                bool_keys=("deferrable", "deferred", "validated", "outgoing", "incoming"),
+                list_keys=("columns", "referenced_columns"))
+    for index in facts["indexes"]:
+        members(index, "name primary unique exclusion nulls_not_distinct immediate valid ready live replica_identity total_columns key_columns method partial expression columns dependency_columns opclasses collations constraint_name definition_digest",
+                bool_keys=("primary", "unique", "exclusion", "nulls_not_distinct", "immediate", "valid", "ready", "live", "replica_identity", "partial", "expression"),
+                int_keys=("total_columns", "key_columns"), list_keys=("columns", "dependency_columns", "opclasses", "collations"),
+                optional_keys=("constraint_name",))
+        require(index["total_columns"] == len(index["columns"]) and index["key_columns"] <= index["total_columns"])
+    for dep in facts["dependencies"]:
+        members(dep, "column kind", optional_keys=("column",))
+    return columns
+
+
+def _validate_prior_source(model, *, varchar=False, boolean=False, integer=False, date_values=False, uuid_values=False, timestamp_values=False, numeric_values=False, timestamptz_values=False, numeric_search=False, prefix_search=False, jsonb_values=False):
+    """Check a prior snapshot's shape and admitted facts without trusting its hash."""
+    def require(condition):
+        if not condition:
+            raise ValueError
+    facts = model['source_schema']
+    columns = _validate_catalog_facts(facts)
+    require(facts["relation"]["relkind"] == "r" and facts["relation"]["relpersistence"] == "p")
+    require(not any(facts["relation"][k] for k in ("relrowsecurity", "relforcerowsecurity", "relhasrules", "inherited", "user_triggers")))
+    pk = columns.get(model["record"]["column"])
+    require(pk is not None and not pk["nullable"] and pk["type_schema"] == "pg_catalog")
+    require(pk["type"] == {"uuid16/v1": "uuid", "int64-be/v1": "int8"}[model["record"]["codec"]])
+    require(not any(pk[k] for k in ("identity", "generated", "default_digest")))
+    primary = [c for c in facts["constraints"] if c["outgoing"] and c["kind"] == "p"]
+    require(len(primary) == 1 and primary[0]["columns"] == [pk["name"]])
+    tenant_name = model["tenancy"].get("column")
+    if tenant_name is not None:
+        tenant = columns.get(tenant_name)
+        require(tenant is not None and tenant["type"] == "uuid" and tenant["type_schema"] == "pg_catalog" and not tenant["nullable"])
+        require(not any(tenant[k] for k in ("identity", "generated", "default_digest")))
+    require(len({f["column"] for f in model["fields"]}) == len(model["fields"]))
+    for field in model["fields"]:
+        source = columns.get(field["column"])
+        require(source is not None)
+        if boolean and source['type'] == 'bool':
+            require(_boolean_mapping_matches(Column('value', Boolean()), source))
+            require(not field['queries'])
+        elif integer and source['type'] in _INTEGER_TYPES:
+            require(_integer_mapping_matches(Column('value', _INTEGER_TYPES[source['type']][0]()), source))
+            require(not field['queries'] or 'order' in field['queries'])
+        elif uuid_values and source['type'] == 'uuid':
+            require(_uuid_mapping_matches(Column('value', Uuid()), source))
+            require(not field['queries'])
+        elif date_values and source['type'] == 'date':
+            require(_date_mapping_matches(Column('value', Date()), source))
+            require(not field['queries'] or 'order' in field['queries'])
+        elif timestamp_values and source['type'] == 'timestamp':
+            require(_timestamp_mapping_matches(Column('value', DateTime()), source))
+            require(not field['queries'] or 'order' in field['queries'])
+        elif timestamptz_values and source['type'] == 'timestamptz':
+            require(_timestamp_mapping_matches(Column('value', DateTime(timezone=True)), source))
+            require(not field['queries'] or 'order' in field['queries'])
+        elif numeric_values and source['type'] == 'numeric':
+            parameters = numeric_parameters(source['typmod'])
+            require(_numeric_mapping_matches(Column('value', Numeric(*parameters) if parameters else Numeric()), source))
+            require(not field['queries'] or numeric_search and not set(field['queries']) - {'equality', 'unique'})
+        elif jsonb_values and source['type'] == 'jsonb':
+            require(_jsonb_mapping_matches(Column('value', postgresql.JSONB()), source))
+            require(not field['queries'])
+        else:
+            require(source['type'] == 'text' or varchar and source['type'] == 'varchar')
+            _native_text_length(source)
+            require('prefix' not in field['queries'] or prefix_search)
+        require(field["column"] not in (pk["name"], tenant_name))
+        require(not any(source[k] for k in ("identity", "generated", "default_digest")))
+        expected_source = {"type": source['type'], "nullable": source["nullable"], "collation": source["collation"]}
+        if source['type'] == 'numeric':
+            expected_source['typmod'] = source['typmod']
+        require(field['source'] == expected_source)
+        if field["queries"] and source['type'] in ('text', 'varchar'):
+            require(_exact_search_collation(source))
+        affected = [i for i in facts["indexes"] if field["column"] in i["columns"] + i["dependency_columns"]]
+        if source['type'] == 'jsonb':
+            require(not affected)
+        require(field["unique_indexes"] == [i["name"] for i in affected if i["unique"]])
+        require(bool(field["unique_indexes"]) == ("unique" in field["queries"]))
+        scope = [tenant_name, field["column"]] if tenant_name is not None else [field["column"]]
+        for constraint in facts["constraints"]:
+            if ((constraint["outgoing"] and field["column"] in constraint["columns"])
+                    or (constraint["incoming"] and field["column"] in constraint["referenced_columns"])):
+                require(source['type'] != 'jsonb')
+                require(constraint["kind"] == "u" and constraint["outgoing"] and constraint["columns"] == scope)
+                require(not constraint["deferrable"] and constraint["validated"])
+        require(not any(d["column"] in (None, field["column"]) for d in facts["dependencies"]))
+        for index in affected:
+            require(index["method"] == "btree" and all(index[k] for k in ("valid", "ready", "live", "immediate")))
+            require(not any(index[k] for k in ("primary", "exclusion", "nulls_not_distinct", "replica_identity", "partial", "expression")))
+            require(index["total_columns"] == index["key_columns"])
+            require(index["columns"] == (scope if index["unique"] else [field["column"]]))
+            scope_ops = ["pg_catalog.uuid_ops"] if tenant_name is not None else []
+            admitted_ops = _index_opclasses(source, field['queries'], retained_pattern=prefix_search)
+            ops = [scope_ops + [op] for op in admitted_ops]
+            collations = ([None] if tenant_name is not None else []) + [source["collation"]]
+            require(index["opclasses"] in (ops if index["unique"] else [[op] for op in admitted_ops]))
+            require(index["collations"] == (collations if index["unique"] else [source["collation"]]))
+        for key, items in (("constraints", facts["constraints"]), ("indexes", facts["indexes"])):
+            originals = field["original"][key]
+            candidates = {i["name"]: i for i in items if field["column"] in i["columns"]
+                          and (i["outgoing"] and i["kind"] == "u" if key == "constraints" else i["constraint_name"] is None)}
+            require(len(originals) == len(candidates) and {o["name"] for o in originals} == set(candidates))
+            for original in originals:
+                native = candidates.get(original["name"])
+                require(native is not None and _digest(original["definition"]) == native["definition_digest"])
+
+
+def _changes(current, previous):
+    changes = []
+    if previous and current.get('layout') != previous.get('layout'):
+        changes.append(Change('layout_changed', '', None,
+                              'Inspect the changed physical layout policy. Compile and verify a new transition before publication.'))
+    old_models = {m["table_id"]: m for m in previous["models"]} if previous else {}
+    for model in current["models"]:
+        old = old_models.get(model["table_id"])
+        old_fields = {f["field_id"]: f for f in old["fields"]} if old else {}
+        if old and (old["tenancy"] != model["tenancy"] or old["record"] != model["record"]):
+            changes.append(Change("context_changed", model["table_id"], None,
+                                  "Reseal every affected current value under its new record and tenant context. Verify before switch."))
+        if old and any(old[key] != model[key] for key in ("model", "schema", "table")):
+            changes.append(Change("mapping_changed", model["table_id"], None,
+                                  "Inspect the new physical mapping. SQL names do not change cryptographic identities."))
+        if old and old["source_schema"] != model["source_schema"]:
+            changes.append(Change("schema_changed", model["table_id"], None,
+                                  "The native schema changed. Inspect dependencies and compile a fresh transition."))
+        for field in model["fields"]:
+            prior = old_fields.get(field["field_id"])
+            if not prior:
+                changes.append(Change("protect_field", model["table_id"], field["field_id"],
+                                      "Stage a bytea payload. Preserve native JSONB and SQL NULL. Verify before switch."
+                                      if field['source']['type'] == 'jsonb' else
+                                      "Stage a bytea payload. Preserve exact text and SQL NULL. Verify before switch."))
+                if "unique" in field["queries"]:
+                    changes.append(Change("preserve_unique", model["table_id"], field["field_id"],
+                                          "Replace native scoped uniqueness with the same scope and distinct-NULL behavior."))
+            elif prior != field:
+                kind = "representation_changed" if prior["descriptor"] != field["descriptor"] else "mapping_changed"
+                changes.append(Change(kind, model["table_id"], field["field_id"],
+                                      "Transform and verify current values. A changed lock cannot activate protection."))
+        for field_id in sorted(old_fields.keys() - {f["field_id"] for f in model["fields"]}):
+            changes.append(Change("decrypt_back_required", model["table_id"], field_id,
+                                  "Recover and verify current values before removing protection."))
+    for table_id in sorted(old_models.keys() - {m["table_id"] for m in current["models"]}):
+        changes.append(Change("decrypt_back_required", table_id, None,
+                              "Recover and verify current values before removing the protected table from the lock."))
+    if previous and (current["writer_inventory"] != previous["writer_inventory"]
+                     or current["search_reviews"] != previous["search_reviews"]):
+        changes.append(Change("host_evidence_changed", "", None,
+                              "Inspect changed writer and value-domain evidence before a transition."))
+    return tuple(changes)
+
+
+def compile_protection(raw: bytes, mapping: Registry, engine: Engine, *,
+                       writers: WriterInventory, search_reviews: tuple[SearchReview, ...] = (),
+                       previous_lock: bytes | None = None, layout: str | None = None) -> ProtectionPlan:
+    """Inspect one declaration and native schema. Return an unapplied proposal.
+
+    The engine must be a synchronous psycopg PostgreSQL engine. Inspection owns
+    a fresh REPEATABLE READ, READ ONLY transaction. It never reads application
+    values. A lock digest detects changes; it is not an authorization signature.
+    None retains the legacy layout. The explicit public-slot policy selects v6.
+    """
+    if layout is not None and (type(layout) is not str or layout != _PUBLIC_SLOTS_LAYOUT):
+        raise PlanningRejected([Issue('unsupported_layout', 'layout',
+            'Use layout=None or the exact preserve-public-slots/v1 policy.')])
+    declaration = parse_protection_declaration(raw)
+    if previous_lock is not None:
+        from cryptalis._search_layout import prefix_plan_scope
+        prefix_plan_scope({'lock': decode_manifest_json(previous_lock)})
+    if any('prefix' in field.queries for model in declaration.models for field in model.fields):
+        from cryptalis._search_layout import require_prefix_qualification
+        require_prefix_qualification()
+    issues = []
+    host, reviews = _host_evidence(declaration, writers, search_reviews, issues)
+    if not isinstance(mapping, Registry) or not isinstance(engine, Engine):
+        issues.append(Issue("unsupported_stack", "compiler", "Supply a SQLAlchemy registry and synchronous PostgreSQL engine."))
+    elif engine.dialect.name != "postgresql" or engine.dialect.driver != "psycopg":
+        issues.append(Issue("unsupported_stack", "engine", "Use SQLAlchemy 2.x with psycopg 3 and PostgreSQL 16."))
+    elif engine.get_execution_options().get("schema_translate_map"):
+        issues.append(Issue("unsupported_mapping", "engine", "Use physical table schemas. Schema translation requires separate admission."))
+    if issues:
+        raise PlanningRejected(issues)
+    mappers = {}
+    for mapper in mapping.mappers:
+        mappers.setdefault(mapper.class_.__name__, []).append(mapper)
+    jsonb_mapping = any(isinstance(column.type, postgresql.JSONB)
+        for model in declaration.models for mapper in mappers.get(model.model, ())
+        for prop in mapper.column_attrs if prop.key in {field.name for field in model.fields}
+        for column in prop.columns)
+    if jsonb_mapping and not _jsonb_hooks_match(engine):
+        raise PlanningRejected([Issue('unsupported_mapping', 'engine',
+            'Use default JSON serialization, deserialization and native driver adapters for protected JSONB.')])
+    models = []
+    used_tables = set()
+    try:
+        with engine.connect().execution_options(isolation_level="REPEATABLE READ", postgresql_readonly=True) as connection, connection.begin():
+            if jsonb_mapping and not _jsonb_hooks_match(engine, connection):
+                raise PlanningRejected([Issue('unsupported_mapping', 'engine',
+                    'Use default JSON serialization, deserialization and native driver adapters for protected JSONB.')])
+            if connection.exec_driver_sql("SHOW transaction_read_only").scalar_one() != "on":
+                raise InspectionUnavailable(None)
+            resolved = {}
+            for model in declaration.models:
+                matches = mappers.get(model.model, [])
+                if len(matches) == 1 and isinstance(matches[0].local_table, Table):
+                    table = matches[0].local_table
+                    if table.schema is None:
+                        rows = _rows(connection, """
+                            SELECT n.nspname AS schema FROM pg_catalog.pg_class t
+                            JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+                            WHERE t.oid=pg_catalog.to_regclass(:name)
+                        """, name=engine.dialect.identifier_preparer.quote_identifier(table.name))
+                        resolved[model.model] = rows[0]["schema"] if rows else None
+            connection.exec_driver_sql("SET LOCAL search_path = pg_catalog")
+            version = int(connection.exec_driver_sql("SHOW server_version_num").scalar_one())
+            encoding = connection.exec_driver_sql("SHOW server_encoding").scalar_one()
+            if version // 10000 != 16 or encoding != "UTF8":
+                issues.append(Issue("unsupported_database", "database", "Use PostgreSQL 16 with UTF8 server encoding."))
+            for model in declaration.models:
+                matches = mappers.get(model.model, [])
+                if len(matches) != 1:
+                    issues.append(Issue("model_resolution", model.model, "Use one unambiguous model name from the supplied registry."))
+                    continue
+                mapper = matches[0]
+                table = mapper.local_table
+                if (not isinstance(table, Table) or mapper.inherits is not None
+                        or mapper.persist_selectable is not table):
+                    issues.append(Issue("unsupported_mapping", model.model, "Use a direct mapping to one ordinary table."))
+                    continue
+                schema = table.schema if table.schema is not None else resolved.get(model.model)
+                if schema is None:
+                    issues.append(Issue("missing_table", model.model, "Create the native application table on the current search path before planning."))
+                    continue
+                address = (schema, table.name)
+                if address in used_tables:
+                    issues.append(Issue("ambiguous_table", model.model, "Declare each protected physical table once."))
+                    continue
+                used_tables.add(address)
+                facts = _schema_facts(connection, *address)
+                if facts is None:
+                    issues.append(Issue("missing_table", model.model, "Create the native application table before planning."))
+                    continue
+                compiled = _compile_model(model, mapper, facts, issues, schema)
+                if compiled:
+                    jsonb_fields = [field for field in compiled['fields'] if field['source']['type'] == 'jsonb']
+                    if jsonb_fields:
+                        if not _jsonb_hooks_match(engine, connection):
+                            issues.append(Issue('unsupported_mapping', 'engine',
+                                'Use default JSON serialization, deserialization and native driver adapters for protected JSONB.'))
+                        native_oids = {row['name']: row['type_oid'] for row in _rows(connection, """
+                            SELECT a.attname AS name, a.atttypid::pg_catalog.text AS type_oid
+                            FROM pg_catalog.pg_attribute a
+                            JOIN pg_catalog.pg_class t ON t.oid=a.attrelid
+                            JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
+                            WHERE n.nspname=:schema AND t.relname=:table
+                              AND a.attnum>0 AND NOT a.attisdropped
+                        """, schema=schema, table=table.name)}
+                        for field in jsonb_fields:
+                            if native_oids.get(field['column']) != '3802':
+                                issues.append(Issue('unsupported_type', model.model + '.' + field['name'],
+                                    'Use the built-in PostgreSQL JSONB type with OID 3802.'))
+                    compiled["source_metadata"] = source_metadata(
+                        connection, schema, table.name, compiled["fields"], sequences=True)
+                    _metadata_issues(connection, schema, table.name, compiled, issues)
+                    for field in compiled["fields"]:
+                        field["descriptor"]["domain_id"] = str(declaration.domain_id)
+                        field["descriptor_digest"] = _digest(field["descriptor"])
+                    models.append(compiled)
+    except (SQLAlchemyError, PsycopgError) as error:
+        sqlstate = getattr(getattr(error, "orig", error), "sqlstate", None)
+        raise InspectionUnavailable(sqlstate) from None
+    if issues:
+        raise PlanningRejected(issues)
+    lock_schema = _lock_schema(models, layout)
+    if lock_schema in ('cryptalis.lock/v2', 'cryptalis.lock/v3', 'cryptalis.lock/v4'):
+        for model in models:
+            del model['source_metadata']['owned_sequences']
+    document = {"schema": lock_schema, "profile": "cf1",
+                "domain_id": str(declaration.domain_id), "database": {"major": 16, "encoding": "UTF8"},
+                "declaration": json.loads(declaration.canonical_bytes()), "models": models,
+                "writer_inventory": host, "search_reviews": reviews}
+    if layout is not None or lock_schema in _LOCK_SCHEMAS[6:]:
+        document['layout'] = layout
+    document["ddl"] = _ddl(document, engine)
+    document["required_readers"] = _required_readers(models)
+    previous = None
+    if previous_lock is not None:
+        previous = _previous_lock(previous_lock, document, engine)
+        old_paths = {(m["schema"], m["table"]): m for m in previous["models"]}
+        for model in models:
+            old = old_paths.get((model["schema"], model["table"]))
+            if old and old["table_id"] != model["table_id"]:
+                issues.append(Issue("stable_identity_changed", model["model"], "Retain the stable table ID. Identity replacement needs an explicit verified transition."))
+            if old:
+                old_fields = {f["column"]: f for f in old["fields"]}
+                for field in model["fields"]:
+                    prior = old_fields.get(field["column"])
+                    if prior and prior["field_id"] != field["field_id"]:
+                        issues.append(Issue("stable_identity_changed", field["name"], "Retain the stable field ID. Identity replacement needs an explicit verified transition."))
+        if issues:
+            raise PlanningRejected(issues)
+        changes = _changes(document, previous)
+    else:
+        changes = _changes(document, None)
+    return ProtectionPlan(_canonical(document), changes,
+                          _digest(previous) if previous is not None else None)
