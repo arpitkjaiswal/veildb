@@ -1,0 +1,188 @@
+# Application and artifact qualification
+
+Use [local development](local-development.md) for prerequisites and the full CI commands.
+This page owns optional application/profile selection. Skips and old receipts do not qualify current code.
+
+## Static code inventory toolchain
+
+`tools/scanner` holds an independent lock for ast-grep 0.51.0. Release verification
+exports hashed dependencies, installs only its binary wheel into a separate
+interpreter, exports its own SBOM and audits that frozen lock. The installed
+Cryptalis wheel then runs native code-inventory and failure/privacy controls.
+Only named public receipts, the scanner toolchain identity, SBOM and audit enter
+the evidence directory. The application/provider lock stays independent.
+
+Default source tests skip the three native scanner cases unless
+`CRYPTALIS_TEST_SCANNER` names an explicit absolute executable. Installed release
+qualification supplies the locked executable and requires those cases to pass.
+A zero-advisory package audit does not audit the bundled native code or replace
+independent security review. The [operator route](walkthrough-migration.md#inventory-python-code-routes)
+defines what the diagnostic does and does not prove.
+
+## Installed baseline
+
+The release harness runs the built wheel through ORM/DML controls and the shared
+initialization/Doctor context, including refusals, read-only database observations,
+cleanup and output failure. These checks run on a fresh PostgreSQL 16 cluster.
+Real OpenBao and independent PostgreSQL recovery follow in separate stages.
+The [provider runner](openbao.md#repeatable-local-qualification) retains private
+service logs and recovery files before removing stopped container shells; cleanup
+failure prevents a passing qualification result.
+The installed shared configuration runs all three rotation workflows, native
+write capture, empty-tenant publication/cancellation and current-value removal.
+The actual OpenBao journey also covers capture/onboarding through AppRole;
+native mappings are rebuilt for plaintext application reads after removal. A dedicated `fresh_cluster_qualification.py --application-config`
+profile restores a retained TEXT backup, plans rotations against its explicit
+restore binding and removes protection after current edits. CI runs this profile
+as well as the keyword/public-slot recovery profile and retains separate receipts.
+`fresh_cluster_qualification.py --project` does the same through
+[`Project`](application.md#project-the-small-api): `recover`, reads, search, an edit, payload
+rotation, decrypt and remove. CI runs it against the built wheel. Use the default work
+directory or a short path: PostgreSQL's socket path is limited to 107 characters.
+Use [local development](local-development.md#automated-checks) for the complete command.
+
+### Published order-leakage experiment
+
+The optional sorting profile protects a full signed-int2 population on a fresh
+PostgreSQL 16 cluster, then gives a separate process dump-visible terms and the
+known public domain. An honest enumerable-domain review must refuse first.
+The subsequent leak experiment deliberately misclassifies that review and does
+not establish healthy admission. [Research and assumptions](research/order-sorting-attack-2026-11-01.md)
+define the source and evidence boundary.
+
+```bash
+CRYPTALIS_ORDER_SORTING_REPORT=/absolute/private/order-sorting.json \
+  .venv/bin/python scripts/online_qualification.py \
+  --workdir /absolute/private/order-sorting-run -- \
+  tests/profile_order_sorting_attack.py -q
+```
+
+Choose new, short absolute paths on a filesystem with enough free space. The
+report contains aggregate recovery counts and snapshot hashes. Ground truth,
+keys and connection inputs stay out of the attacker input. A sparse population
+or randomized storage-only frames make this sorting protocol inapplicable;
+abstention is not a security pass. Search rotation must be evaluated separately
+from term replacement. This profile supplies no real-data recovery estimate or
+production-gate qualification.
+
+### Receipt outcome fields
+
+Receipts also record `pytest_report_counts`. It separates ordinary `test_calls`,
+`subtest_calls`, `setup`, `teardown`, and failed/skipped `collection` reports.
+Each bucket counts final raw pytest outcomes. `selected_items` counts collected
+items after selection, including items whose setup prevents a call.
+Keep these buckets separate. Their sum is not a test count.
+
+Expected failures retain raw skipped outcomes. Non-strict unexpected passes
+retain raw passed outcomes. These fields do not reproduce terminal categories.
+The legacy `counts` and `modules` retain their original call/error aggregation,
+which includes subtest calls and omits collection/setup skips.
+The counter checks run with pytest 9.1.1 and its built-in pytest/unittest subtests.
+Other versions and external report plugins remain unverified.
+
+### Pinned external application check
+
+`tests/test_smolink_application.py` extracts Smolink revision
+`498d24bae999ed53ad85e1c1f1a09ea7fa151aa4` from a local checkout with Git.
+It never imports the checkout's working files or settings file.
+It checks source hashes and import origins before recording adoption evidence.
+
+Use a separate Python 3.13 interpreter with Smolink's dependencies and Cryptalis.
+Install no package into the application checkout for this test.
+Supply an available `redis-server` executable. The test starts a disposable server
+on a private Unix socket. PostgreSQL access still uses both fresh private files
+through the mandatory wrapper.
+
+```bash
+CRYPTALIS_SMOLINK_CHECKOUT=/path/to/smolink \
+  /path/to/python3.13 scripts/test_postgres.py -- tests/test_smolink_application.py -q
+```
+
+An explicit opt-in fails if its interpreter, packages, source revision, or services
+are unavailable. Without the opt-in, the ordinary suite skips this external test.
+The [status record](history/implementation-2026-10.md#pinned-smolink-adoption-2026-10-22) names the two tested
+dependency cells and their limits. The workload protects only `Url.destination`.
+HTTP covers URL creation and refusal cases. Repository and ORM calls cover other CRUD operations.
+The host replaces the session dependency and supplies protection policy and maintenance authority.
+
+### Automated application qualification matrix
+
+Run the online HTTP row through `scripts/online_qualification.py --http`.
+Use `--http-fresh` for its protected export, source-cluster shutdown and new-cluster recovery.
+Run the other selected rows through `scripts/fresh_cluster_qualification.py`.
+The fresh-cluster harness runs export and isolated restore through `scripts/test_postgres.py`.
+The online harness creates three private role files on an isolated cluster and probes all three before the application test.
+The `fresh_cluster_qualification.py` phases reload two private files and probe both roles.
+All `online_qualification.py` phases reload three private files and probe all three roles.
+If a probe fails, stop. Do not retry or substitute a database.
+Use the pinned snapshots and the exact dependency cell recorded in status.
+Keep each work directory new. The installed qualification runner must resolve
+Cryptalis imports from the reviewed wheel instead of the source checkout.
+
+| Row | Profile | Application journey | Evidence boundary |
+|---|---|---|---|
+| Tenant-scoped online lifecycle | `online_qualification.py -- tests/test_online_tenants.py -q` | Native capture and tenant moves, scoped uniqueness, protected backup, source-schema decommission, adoption, all rotations and current-data native exit | Synthetic mixed-scope SQLAlchemy fixture; second database on the same cluster; in-process development custody. Source and installed evidence remain separate |
+| Original online HTTP fresh recovery | `online_qualification.py --http-fresh` | Online adoption, protected backup, checked source shutdown, fresh restore/adoption, root/payload/search rotations, original HTTP and latest-value native exit | 26 unchanged files, three freshly probed roles per cluster, reconstructible public custody. No production fencing or pause claim |
+| Original HTTP online adoption | `online_qualification.py --http` | Concurrent original signup, native HTTP during capture, fenced cutover, protected HTTP/search, latest-value reverse and package-free HTTP restart | 26 unchanged pinned files. Three roles. No backup/rotation repeat or production downtime qualification |
+| Original HTTP/authentication | `--sqlmodel-http` | Native routes, Doctor, protection, search, backup, fresh adoption, root/payload/search rotation, latest-value removal, package-free HTTP restart | 26 pinned files. TestClient and loopback SMTP. Explicit single tenancy and public fixture keys |
+| Original SQLModel CRUD | `--sqlmodel-public-slots` | Three protected fields, public slots, fresh adoption, direct restore-binding search rotation, native exit | Six pinned files. Positive control for the shared harness |
+| Original Smolink | `--smolink` | Async URL routes/repository operations, protected backup, fresh adoption, rotations and native exit | Separate pinned revision and historical qualification. No new execution claim follows from the HTTP row |
+
+Supply `CRYPTALIS_SQLMODEL_HTTP_SOURCE` for the HTTP row.
+Supply `CRYPTALIS_SQLMODEL_APP_SOURCE` for the CRUD row.
+Supply `CRYPTALIS_SMOLINK_CHECKOUT` and a local Redis executable for Smolink.
+
+```bash
+CRYPTALIS_SQLMODEL_HTTP_SOURCE=/path/to/pinned-http-snapshot \
+  /path/to/python3.13 scripts/fresh_cluster_qualification.py \
+  --sqlmodel-http --workdir /tmp/cryptalis-http-fresh-new-run
+```
+
+The integer recovery row also accepts `--integer 32 --column-name integer`.
+This keeps the Python property while exercising PostgreSQL's keyword identifier
+spelling through payload rotation, backup, fresh adoption and current-data exit.
+Add `--public-slots` for original column-position preservation and
+`--installed-wheel /path/to/reviewed.whl` to bind both phases to that artifact.
+Use its installed interpreter with an empty `PYTHONPATH`. See the
+[keyword recovery boundary](history/implementation-2026-10.md#keyword-identifier-fresh-recovery-2026-10-28).
+
+The earlier original HTTP CLI journey owns initialization and five actual
+SIGKILL/resume checkpoints. The new HTTP fresh row owns genuine restore and
+post-adoption authentication. Neither row proves every step or an external KMS.
+Retain these separate boundaries when reporting the full developer journey.
+
+## Native JSONB storage
+
+Run the native/protected value, admission, mutation, rotation and online-capture
+workflows on a newly initialized disposable cluster:
+
+```bash
+CRYPTALIS_JSONB_PREVIOUS_READER_PYTHON=/absolute/retained-v14/bin/python \
+  .venv/bin/python scripts/online_qualification.py \
+  --workdir /absolute/new-jsonb-source -- \
+  tests/test_jsonb_storage.py tests/test_jsonb_admission.py \
+  tests/test_jsonb_boundaries.py tests/test_jsonb_async_failures.py \
+  tests/test_jsonb_lifecycle.py -q
+```
+
+The old interpreter must contain the actual immutable earlier wheel. Without
+that optional environment variable its reader control skips explicitly; no
+reader-compatibility claim follows. All database runs still use the mandatory
+private-file probes and byte-binding wrapper inside the harness.
+
+For actual installed-wheel export and adoption on a distinct fresh cluster:
+
+```bash
+/absolute/installed/bin/python scripts/online_qualification.py \
+  --installed-wheel /absolute/inspected.whl \
+  --workdir /absolute/new-jsonb-recovery --fresh-scalar jsonb
+```
+
+Repeat with a new work directory and `--public-slots` for the other layout.
+The fixed profile checks exact `jsonb_send` bytes, SQL NULL versus JSON null,
+all three source rotations, restored-target authentication/tamper refusal,
+current edits, native removal and an import-denied SQLAlchemy restart. The
+export process exits and drops its application schema before the restore
+process starts; the outer scalar harness's source cluster remains running
+until its cleanup. This supplies no production deployment-fencing, provider
+custody, RPO/RTO or JSON-search qualification. Retain every receipt separately.

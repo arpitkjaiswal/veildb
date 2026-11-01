@@ -1,0 +1,212 @@
+# Metadata preservation and lock-format evolution (research)
+
+**Status: research only.** This note compares gaps and options. It does not change
+`cryptalis.lock/v1`, `cryptalis.protection/v1`, `cryptalis.transition/v1` or
+`cryptalis.restore/v1`. It adds no runtime claim and no gate evidence.
+A lock-format change needs explicit approval and a reviewed amendment.
+
+## Recorded facts today
+
+`_schema_facts` in `src/cryptalis/manifest/compiler.py` records these facts in the lock:
+
+- **Relation:** `relkind`, `relpersistence`, row-security enable/force flags, `relhasrules`,
+  inherited relation exists (boolean), and a non-internal trigger exists (boolean).
+- **Column:** `attnum`, name, type, type schema, typmod, nullability, identity, generated,
+  default digest, collation name/schema/determinism/provider.
+- **Constraint:** name, kind, deferrable, deferred, validated, direction, column list,
+  referenced columns, and the definition digest plus definition text in the plan artifact.
+- **Index:** name, primary/unique/exclusion/null-not-distinct/immediate/valid/ready/live
+  flags, replica identity, column counts, method, partial/expression flags, column list,
+  dependency columns, operator classes, collations, constraint name, definition digest.
+- **Dependency:** column name and dependent object kind (rewrite, attribute default,
+  routine).
+
+The in-place reverse restores a protected column as native `text` with its admitted
+collation, resets `NOT NULL`, and recreates the recorded constraints and indexes from the
+recorded definitions. Other columns are not rebuilt. Removal compares
+`_metadata_diff(source_schema, current_facts)`, which ignores only `attnum`.
+
+## Not recorded
+
+These catalog facts have no field in the lock:
+
+- Column comment, statistics target (`attstattarget`), storage (`attstorage`),
+  compression (`attcompression`), column ACL (`attacl`), column options (`attoptions`).
+- Table options (`reloptions`, e.g. fillfactor/autovacuum), tablespace, table ACL,
+  owner, and partition key/bounds.
+- Row-security policy definitions (`pg_policy`), rule bodies, trigger definitions,
+  and index or constraint comments. Index storage options and tablespace are not separate
+  fields, but `pg_get_indexdef` embeds them in the recorded definition text.
+- Extended statistics objects (`pg_statistic_ext`).
+- Sequence parameters, ownership and ACLs for non-identity keys. A sequence owned by a
+  protected column is now refused; other sequences are not touched.
+
+Some of these survive in place because the table is not rebuilt: table comment, table
+options, table ACL, and owner stay attached to the relation. Admission refuses RLS,
+rules, user triggers, inheritance and partitioning, so they never reach a transition.
+Protected-column facts do not survive: the switch drops the source column and renames the
+staging column. The same loss applies to index and constraint comments for recreated
+objects. Index options survive because the recorded `CREATE INDEX` text carries them.
+
+## Preservation matrix
+
+| Metadata | In-place reverse | Fresh-cluster restore from protected dump |
+|---|---|---|
+| Protected column type, collation, nullability | Restored | Restored |
+| Recorded constraints and indexes | Restored from definitions | Restored by `pg_dump` |
+| Protected-column comment/statistics/storage/compression/ACL/options | Lost; refused at protection | Lost |
+| Index options and tablespace | Restored through the recorded definition | Restored by `pg_dump` |
+| Index and constraint comments | Lost; refused at protection | Lost |
+| Table comment/options/ACL/owner | Kept | Kept by `pg_dump` |
+| RLS, rules, user triggers, inheritance, partitioning | Refused at protection | Not applicable |
+| Physical column position (`attnum`) | Changed | Changed |
+| Extended statistics on a protected column | Refused at protection | Not applicable |
+| Sequence owned by a protected column | Refused at protection | Not applicable |
+
+The protected dump carries `bytea` under the protected column name. The source column was
+dropped when protection switched, so the dump cannot carry its old column metadata.
+
+## Risks
+
+- A comment or storage setting on a protected column disappears without a typed refusal.
+  Removal does not detect it because the lock never recorded it.
+- An index recreated from `pg_get_indexdef` keeps options and tablespace but loses its
+  comment. Definition text carries storage parameters, not comments.
+- A column statistics target loss changes planner behavior after decrypt-back.
+- The fresh-cluster path is stronger than in-place reverse, but it is not a fix for the
+  protected-column loss.
+
+## Lock evolution options
+
+### A. New lock version with a `source_metadata` section
+
+Add per-model/per-column entries for comments, statistics, storage, compression, ACL and
+index metadata. Bind each entry with a digest and restore it in the reverse switch.
+Advantages: one authenticated artifact; offline review; exact drift detection.
+Costs: a new `cryptalis.lock/v1`-incompatible version; admission code for every entry;
+restoration statements for ACLs, comments and settings; role-name mapping on a fresh
+cluster. Unknown entry kinds need an explicit policy: refuse, or preserve opaquely.
+
+### B. Separate host inventory
+
+Capture the same facts in a host-owned inventory and require it at reverse approval.
+Advantages: no lock-format change. Costs: a second authority that is not in the lock
+digest; drift between inventory and lock; the host must prove the inventory is current.
+This option weakens the "database state is not restore authority" rule unless the
+inventory is cryptographically bound to the plan.
+
+### C. Differential dump oracle
+
+Use `pg_dump --schema-only` as the verification oracle for both paths. Advantages:
+covers every dumped fact, not a hand-picked list. Costs: it is not an in-place
+restoration mechanism; it needs statement rewriting and owned-object filtering; it does
+not preserve `attnum` either.
+
+## Compatibility rules to evaluate
+
+1. A reader rejects an unknown lock schema. The current `_previous_lock` already compares
+   the full key set, so additive fields fail closed.
+2. A new reader may admit the old lock with documented defaults, or refuse it. It must not
+   guess missing metadata.
+3. A format change needs an upgrade path for active deployments: recompile from the
+   source schema, or refuse and require decrypt-back first.
+4. Every restored fact needs a native PostgreSQL oracle test, a negative admission test,
+   and a drift refusal.
+5. No entry is dropped silently. Unknown kinds have an explicit refusal or an opaque
+   preserved form with a digest.
+
+## Observed in the isolated probe: 2026-10-19
+
+`tests/test_deprotection.py::test_unrecorded_column_metadata_is_lost_without_detection`
+builds a table with a table comment, a protected-column comment, a plain-column comment,
+a statistics target, external storage, a column ACL, an index comment and an index
+fillfactor. It protects and fully reverses the table, then reads the catalog again.
+The focused runs report **61 passed** for
+[SQLAlchemy 2.1.3](../_reset/metadata-gap-focused-sa21-20261019.json) and
+[SQLAlchemy 2.0.51](../_reset/metadata-gap-focused-sa20-20261019.json). The full suites
+report **1,307 passed, 2 skipped**
+([2.1.3](../_reset/metadata-gap-full-sa21-20261019.json)) and **1,279 passed, 30 skipped**
+([2.0.51](../_reset/metadata-gap-full-sa20-20261019.json)).
+
+Observed results:
+
+- Table comment, plain-column comment and plain-column ACL survive.
+- Protected-column comment, statistics target, storage setting and ACL are lost.
+- The index comment is lost. The index fillfactor survives because the recreated index
+  definition text carries it.
+- `_metadata_diff` reports no difference after the losses. The gap is silent.
+- A metadata change after plan compile is refused when it enters the recorded facts.
+  `ALTER INDEX ... SET (fillfactor=...)` changes the definition digest, and the executor
+  refuses with `source_schema_changed`.
+
+## Extended statistics, column options and owned sequences: 2026-10-19
+
+Two further silent losses were found after the guard landed:
+
+- `ALTER TABLE ... ALTER COLUMN ... SET (n_distinct=...)` writes `attoptions`. The
+  protection switch loses it. The first probe did not inspect `attoptions`.
+- A `pg_statistic_ext` object that references a protected column is dropped by the
+  protection switch with no error and no `_metadata_diff`. A probe with
+  `CREATE STATISTICS ... ON name, label` reached `PENDING` and the statistics object was
+  gone. PostgreSQL requires at least two columns per extended statistics object.
+
+A third probe found that a sequence with `OWNED BY` on the protected column is dropped
+with the column. A sequence owned by a plain column survives. The guard now refuses all
+three. Extended statistics and owned sequences use `unsupported_dependency`; column
+options use `unsupported_protected_metadata`. The positive case creates extended
+statistics on a plain column, a sequence owned by a plain column, and table options; all
+survive decryption and removal.
+
+The local cell has only `pg_default` and `pg_global` tablespaces, and the least-privilege
+owner cannot create another. Tablespace moves therefore remain UNKNOWN; the table is not
+rebuilt, so an existing tablespace should survive in place.
+
+## Guard implemented: 2026-10-19
+
+The first guard landed without a lock change. Protection planning refused protected
+columns with a comment, non-default statistics target, storage or compression setting,
+column grant or column option, and refused comments on constraints and indexes that it
+recreates, extended statistics that reference a protected column, and sequences owned by
+a protected column. Reverse planning, the protection switch, and the reverse switch
+refused the attributes and objects when they appeared after planning.
+
+## Lock v2 capture and restore: 2026-10-21
+
+`cryptalis.lock/v2` adds `source_metadata` to each model. It captures protected column
+comments, statistics targets, storage, compression, options, and grants; constraint and
+index comments; and extended statistics on protected columns. The protection switch
+applies captured grants to the ciphertext column so runtime column privileges survive
+the swap. Reverse restores them to the plaintext column. The protection switch
+compares the current catalog with the capture before expand and before the switch and
+raises `source_metadata_changed` on a difference. Reverse still refuses metadata added to
+the ciphertext column, then restores the captured facts and compares the catalog with the
+lock. The reader accepts v1 and v2; v1 carries no metadata.
+
+Owned sequences and expression extended statistics remain refused. A missing grantee
+role raises `acl_role_missing`; no mapped grant is attempted.
+
+Evidence is in `tests/test_protection_compiler.py`,
+`tests/test_deprotection.py`, and `tests/test_migration.py`. The positive case is now
+`test_source_metadata_is_preserved_through_decrypt_back`, which checks grants at
+capture, at `PENDING`, and after removal. The full suite reports
+**1,316 passed, 2 skipped** on SQLAlchemy 2.1.3
+([receipt](../_reset/lock-v2-full-sa21-20261021-3.json)). The SQLAlchemy 2.0.51 cell was
+not rerun because its local virtual environment is absent. The earlier refusal receipts
+remain historical evidence for v1 locks.
+
+## Next steps
+
+1. Extend fresh-cluster adoption to v2 locks with captured metadata, including ACL roles.
+2. Test missing roles and invalid ACL entries when a role-creating fixture is available.
+3. Probe tablespace moves when a second tablespace is available. RLS, rules, triggers,
+   partitioning, owned sequences, and expression extended statistics are refused; table
+   options, column grants, and unowned sequences survive.
+
+## Open questions
+
+- Physical column order needs a table rewrite. Does any safe rewrite meet the
+  near-zero-downtime requirement?
+- Do ACL digests suffice, or does the lock need full grant statements?
+- How are role names mapped on a fresh cluster with different principals?
+- Which object kinds (partitioned tables, extensions, sequences) stay out of scope?
+- Can storage and compression be set on admitted `text` columns without data rewrite?

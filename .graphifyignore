@@ -1,0 +1,38 @@
+# Cryptalis Graphify scope: active product code and canonical contracts only.
+# spikes/revamp/ is historical reference evidence, not active product code.
+spikes/
+# Generated verification receipts and historical research are evidence, not
+# alternate specifications. They stay on disk but out of the active graph.
+docs/_reset/
+docs/research/
+# Machine-local caches, environments, and build output.
+graphify-out/
+.local/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+docs/_build/
+*.egg-info/
+.mypy_cache/
+.hypothesis/
+.coverage
+# Private material is never indexed.
+.env
+.env.*
+*.pem
+*.key
+credentials/
+secrets/
+.aws/
+.ssh/
+*token-checks*
+.cryptalis-test-url
+.cryptalis-test-runtime-url
+*credentials*
+*.pgpass
+.pgpass
+*.log
